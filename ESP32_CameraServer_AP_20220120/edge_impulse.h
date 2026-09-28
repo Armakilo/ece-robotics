@@ -8,7 +8,7 @@
 // #define EI_TENSOR_ARENA_LOCATION ".psram"
 
 
-#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           160
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           160 //might have to relplace src_w/src_h with these
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           120
 #define EI_CAMERA_FRAME_BYTE_SIZE                 3
 

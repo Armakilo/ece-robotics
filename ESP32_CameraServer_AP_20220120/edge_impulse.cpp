@@ -48,79 +48,14 @@ static bool debug_nn = false; // Set this to true to see e.g. features generated
 static bool is_initialised = false;
 uint8_t *snapshot_buf; //points to the output of the capture
 
-// static camera_config_t camera_config = { //might not be nescessary
-//     .pin_pwdn = PWDN_GPIO_NUM,
-//     .pin_reset = RESET_GPIO_NUM,
-//     .pin_xclk = XCLK_GPIO_NUM,
-//     .pin_sscb_sda = SIOD_GPIO_NUM,
-//     .pin_sscb_scl = SIOC_GPIO_NUM,
-
-//     .pin_d7 = Y9_GPIO_NUM,
-//     .pin_d6 = Y8_GPIO_NUM,
-//     .pin_d5 = Y7_GPIO_NUM,
-//     .pin_d4 = Y6_GPIO_NUM,
-//     .pin_d3 = Y5_GPIO_NUM,
-//     .pin_d2 = Y4_GPIO_NUM,
-//     .pin_d1 = Y3_GPIO_NUM,
-//     .pin_d0 = Y2_GPIO_NUM,
-//     .pin_vsync = VSYNC_GPIO_NUM,
-//     .pin_href = HREF_GPIO_NUM,
-//     .pin_pclk = PCLK_GPIO_NUM,
-
-//     //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
-//     .xclk_freq_hz = 20000000,
-//     .ledc_timer = LEDC_TIMER_0,
-//     .ledc_channel = LEDC_CHANNEL_0,
-
-//     .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
-//     .frame_size = FRAMESIZE_QVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
-
-//     .jpeg_quality = 12, //0-63 lower number means higher quality
-//     .fb_count = 1,       //if more than one, i2s runs in continuous mode. Use only with JPEG
-//     // .fb_location = CAMERA_FB_IN_PSRAM,
-//     // .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
-// };
+// KEY -> needed to redifine EI functions to use PSRAM, otherwise we get memory issues
 
 void *ei_malloc(size_t n)           { void *p = ps_malloc(n);    return p ? p : malloc(n); }
 void *ei_calloc(size_t n, size_t s) { void *p = ps_calloc(n, s); return p ? p : calloc(n, s); }
 void  ei_free(void *p)              { free(p); }
 
 
-//they put their setup function here
-
-void start_edging(void){ //might not need this function
-
-    while (!Serial);
-    Serial.println("Edge Impulse Inferencing Demo");
-    if (ei_camera_init() == false) {
-        ei_printf("Failed to initialize Camera!\r\n");
-    }
-    else {
-        ei_printf("Camera initialized\r\n");
-    }
-
-    ei_printf("\nStarting continious inference in 2 seconds...\n");
-    ei_sleep(2000);
-}
-
-
 //function already uses existing rgb888 data
-void run_inference(uint8_t *rgb) {
-    if (!is_initialised) ei_camera_init();
-
-    snapshot_buf = rgb;                 // use the caller's buffer
-    ei::signal_t signal;
-    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-    signal.get_data = &ei_camera_get_data;
-
-    ei_impulse_result_t result = {0};
-    if (run_classifier(&signal, &result, debug_nn) != EI_IMPULSE_OK) return;
-
-    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        ei_printf("%s: %.5f\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
-    }
-}
-
 
 bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
 {
@@ -129,7 +64,7 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
     }
 
     // Allocate enough for raw EI size and model input size
-    size_t raw_pixels = EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
+    size_t raw_pixels = src_w * src_h;
     size_t model_pixels = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
     size_t max_pixels = raw_pixels > model_pixels ? raw_pixels : model_pixels;
 
@@ -232,6 +167,19 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
 
     return true;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 void find_stop()
 {

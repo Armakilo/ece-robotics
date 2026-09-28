@@ -474,7 +474,7 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
 
 
 
-static void colour_detect_task(void *arg){
+static void object_detect_task(void *arg){ //colour and AI image recognition
     while(1){
 
 
@@ -491,7 +491,7 @@ static void colour_detect_task(void *arg){
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
                 if(im){
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
-                        classify_rgb888(im->item, fb->width, fb->height);
+                        classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function
                         colour_detect(im);
                     }
                     dl_matrix3du_free(im);
@@ -1301,6 +1301,6 @@ void startCameraServer()
     }
 
     
-    xTaskCreatePinnedToCore(colour_detect_task, "colour", 4096, NULL, 1, NULL, 0); //start executing camera task
+    xTaskCreatePinnedToCore(object_detect_task, "colour", 16384, NULL, 1, NULL, 0); //start executing camera task
 
 }
