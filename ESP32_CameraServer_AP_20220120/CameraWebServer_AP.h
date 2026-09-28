@@ -11,7 +11,7 @@
 #define _CameraWebServer_AP_H
 #include "esp_camera.h"
 #include <WiFi.h>
-
+#define CAMERA_MODEL_M5STACK_WIDE
 class CameraWebServer_AP
 {
 

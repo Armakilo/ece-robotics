@@ -18,9 +18,13 @@
 #include "camera_index.h"
 #include "Arduino.h"
 
+#include "edge_impulse.h"
+
 #include "fb_gfx.h"
 #include "fd_forward.h"
 #include "fr_forward.h"
+
+
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -41,7 +45,7 @@
 #define DIST_THRESH 10
 #define MAX_BLOBS 6
 
-
+//int width, height;
 
 typedef struct
 {
@@ -469,9 +473,18 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
 
 
 
+
 static void colour_detect_task(void *arg){
     while(1){
+
+
+
         if(!stream_active){
+
+            find_stop();
+            
+
+            
             
             camera_fb_t *fb = esp_camera_fb_get();
             if(fb){

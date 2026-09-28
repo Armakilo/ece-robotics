@@ -29,13 +29,14 @@
 //#define CAMERA_MODEL_ESP_EYE
 //#define CAMERA_MODEL_M5STACK_PSRAM
 
-#define CAMERA_MODEL_M5STACK_WIDE
+
 
 //#define CAMERA_MODEL_AI_THINKER
 
 #include "CameraWebServer_AP.h"
 #include "camera_pins.h"
 #include "esp_system.h"
+#include "edge_impulse.h"
 
 // #include "BLEAdvertisedDevice.h"
 // BLEAdvertisedDevice _BLEAdvertisedDevice;
@@ -130,4 +131,7 @@ void CameraWebServer_AP::CameraWebServer_AP_Init(void)
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.softAPIP());
   Serial.println("' to connect");
+
+  
+
 }
