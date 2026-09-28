@@ -481,7 +481,7 @@ static void colour_detect_task(void *arg){
 
         if(!stream_active){
 
-            find_stop();
+            
             
 
             
@@ -491,6 +491,7 @@ static void colour_detect_task(void *arg){
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
                 if(im){
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
+                        classify_rgb888(im->item, fb->width, fb->height);
                         colour_detect(im);
                     }
                     dl_matrix3du_free(im);

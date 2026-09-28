@@ -7,6 +7,9 @@
  * @LastEditTime: 2020-09-07 09:40:03
  */
 //#include <EEPROM.h>
+#define EI_TENSOR_ARENA_LOCATION ".psram"
+
+
 #include "CameraWebServer_AP.h"
 #include <WiFi.h>
 #include "esp_camera.h"
@@ -184,6 +187,8 @@ void FactoryTest(void)
 }
 void setup()
 {
+  Serial.printf("Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  Serial.printf("Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   Serial.begin(9600);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   //http://192.168.4.1/control?var=framesize&val=3
