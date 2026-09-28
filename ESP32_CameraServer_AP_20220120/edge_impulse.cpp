@@ -55,6 +55,66 @@ void *ei_calloc(size_t n, size_t s) { void *p = ps_calloc(n, s); return p ? p : 
 void  ei_free(void *p)              { free(p); }
 
 
+// ---------------- Stop sign result hand-off ----------------
+// Detection runs in object_detect_task (core 0); Serial2 is written from
+// loop() (core 1). The result is stored here under a spinlock so the two
+// tasks never write Serial2 at the same time.
+
+#define STOP_LABEL      "Stop sign"   // must match your Edge Impulse label exactly
+#define STOP_MIN_CONF   0.60f    // ignore weaker detections
+
+static portMUX_TYPE     stop_mux = portMUX_INITIALIZER_UNLOCKED;
+static StopSignResult   latest_stop = {false, 0, 0, 0, 0, 0};
+static bool             stop_result_new = false;
+
+static uint8_t pct(uint32_t v, uint32_t full) {
+    uint32_t p = (v * 100) / full;
+    return p > 100 ? 100 : (uint8_t)p;
+}
+
+static void publish_stop_result(const ei_impulse_result_t &result)
+{
+    StopSignResult r = {false, 0, 0, 0, 0, 0};
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    uint32_t best_area = 0;
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+        const ei_impulse_result_bounding_box_t &bb = result.bounding_boxes[i];
+        if (bb.value < STOP_MIN_CONF) continue;
+        if (strcmp(bb.label, STOP_LABEL) != 0) continue;
+
+        uint32_t area = bb.width * bb.height;
+        if (area > best_area) {            // keep the biggest (closest) sign
+            best_area = area;
+            r.found = true;
+            r.cx   = pct(bb.x + bb.width / 2,  EI_CLASSIFIER_INPUT_WIDTH);
+            r.cy   = pct(bb.y + bb.height / 2, EI_CLASSIFIER_INPUT_HEIGHT);
+            r.w    = pct(bb.width,  EI_CLASSIFIER_INPUT_WIDTH);
+            r.h    = pct(bb.height, EI_CLASSIFIER_INPUT_HEIGHT);
+            r.conf = (uint8_t)(bb.value * 100);
+        }
+    }
+#else
+    #warning "Model is classification-only: stop sign position/size will not be available"
+#endif
+
+    portENTER_CRITICAL(&stop_mux);
+    latest_stop = r;
+    stop_result_new = true;
+    portEXIT_CRITICAL(&stop_mux);
+}
+
+bool get_stop_sign_result(StopSignResult *out)
+{
+    portENTER_CRITICAL(&stop_mux);
+    bool fresh = stop_result_new;
+    *out = latest_stop;
+    stop_result_new = false;
+    portEXIT_CRITICAL(&stop_mux);
+    return fresh;
+}
+
+
 //function already uses existing rgb888 data
 
 bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
@@ -112,8 +172,8 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
         return false;
     }
 
-    // Optional: print predictions here
-    // ...
+    // Hand the result to loop(), which forwards it to the UNO
+    publish_stop_result(result);
 
     ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
                 result.timing.dsp, result.timing.classification, result.timing.anomaly);

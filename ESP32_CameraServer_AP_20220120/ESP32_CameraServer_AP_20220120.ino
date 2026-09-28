@@ -13,6 +13,7 @@
 #include "CameraWebServer_AP.h"
 #include <WiFi.h>
 #include "esp_camera.h"
+#include "edge_impulse.h"
 WiFiServer server(100);
 
 #define RXD2 33
@@ -20,6 +21,28 @@ WiFiServer server(100);
 CameraWebServer_AP CameraWebServerAP;
 
 bool WA_en = false;
+
+// Forward the latest stop sign result to the UNO over Serial2.
+// Format (same JSON style as the Elegoo commands):
+//   {"N":200,"D1":found,"D2":cx,"D3":cy,"D4":w,"D5":h}
+// cx, cy, w, h are percent of the image (0-100).
+// Sent once per inference (~2x per second), found or not, so the UNO
+// always knows when the sign has disappeared.
+void SendStopSignToUno(void)
+{
+  StopSignResult r;
+  if (!get_stop_sign_result(&r))
+    return;
+
+  char msg[64];
+  snprintf(msg, sizeof(msg),
+           "{\"N\":200,\"D1\":%u,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u}",
+           r.found ? 1 : 0, r.cx, r.cy, r.w, r.h);
+  Serial2.print(msg);
+
+  if (r.found)
+    Serial.printf("[STOP] cx=%u cy=%u w=%u h=%u conf=%u%%\n", r.cx, r.cy, r.w, r.h, r.conf);
+}
 
 void SocketServer_Test(void)
 {
@@ -37,6 +60,7 @@ void SocketServer_Test(void)
     bool data_begin = true;
     while (client.connected()) //如果客户端处于连接状态
     {
+      SendStopSignToUno(); // loop() is blocked while the app is connected, so send from here too
       if (client.available()) //如果有可读数据
       {
         char c = client.read();             //读取一个字节
@@ -213,6 +237,7 @@ void loop()
 {
   SocketServer_Test();
   FactoryTest();
+  SendStopSignToUno();
 }
 
 /*

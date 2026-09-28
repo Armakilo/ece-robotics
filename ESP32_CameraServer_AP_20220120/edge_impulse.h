@@ -22,4 +22,20 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h);
 
 extern uint8_t *snapshot_buf;
 
+// ---- Stop sign result shared with the main loop (sent to the UNO) ----
+// All positions/sizes are percent of the model's input image (0-100),
+// so the UNO doesn't need to know the model resolution.
+struct StopSignResult {
+    bool    found;
+    uint8_t cx;    // centre x, 0 = left edge, 100 = right edge
+    uint8_t cy;    // centre y, 0 = top, 100 = bottom
+    uint8_t w;     // box width
+    uint8_t h;     // box height
+    uint8_t conf;  // confidence 0-100
+};
+
+// Copies the latest result into *out. Returns true only if a new
+// inference has finished since the last call.
+bool get_stop_sign_result(StopSignResult *out);
+
 #endif
