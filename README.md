@@ -1,4 +1,4 @@
-NOTE: This code was built off of the files that came with the Elegoo Smart Robot Car V4.0 With Camera.
+NOTE: This code was built off of the files that came with the Elegoo Smart Robot Car V4.0 With Camera, and sample code provided by Edge Impulse.
 
 This is the main repository for our ECE 4333 project. We should keep all code in this repository, and keep it up-to-date to make things easy. I have created the first commit.
 
