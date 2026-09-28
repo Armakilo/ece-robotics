@@ -122,164 +122,114 @@ void run_inference(uint8_t *rgb) {
 }
 
 
-// bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
-// {
-//     if (!is_initialised && !ei_camera_init()) {
-//         return false;
-//     }
-
-//     // Allocate enough for raw EI size and model input size
-//     size_t raw_pixels = EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
-//     size_t model_pixels = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-//     size_t max_pixels = raw_pixels > model_pixels ? raw_pixels : model_pixels;
-
-//     uint8_t *buf = (uint8_t*)ps_malloc(max_pixels * EI_CAMERA_FRAME_BYTE_SIZE);
-//     if (!buf) {
-//         ei_printf("ERR: Failed to allocate inference buffer\n");
-//         return false;
-//     }
-
-//     // Copy or resize from app_http frame to EI raw size -> might have to remove this later
-//     if (src_w == EI_CAMERA_RAW_FRAME_BUFFER_COLS &&
-//         src_h == EI_CAMERA_RAW_FRAME_BUFFER_ROWS) {
-//         memcpy(buf, rgb, raw_pixels * EI_CAMERA_FRAME_BYTE_SIZE);
-//     } else {
-//         ei::image::processing::crop_and_interpolate_rgb888(
-//             (uint8_t*)rgb, src_w, src_h,
-//             buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS);
-//     }
-
-//     // If the model expects a different size, resize in-place
-//     if (EI_CLASSIFIER_INPUT_WIDTH != EI_CAMERA_RAW_FRAME_BUFFER_COLS ||
-//         EI_CLASSIFIER_INPUT_HEIGHT != EI_CAMERA_RAW_FRAME_BUFFER_ROWS) {
-//         ei::image::processing::crop_and_interpolate_rgb888(
-//             buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
-//             buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
-//     }
-
-//     // Point the existing get_data callback at our buffer
-//     uint8_t *old_snapshot = snapshot_buf;
-//     snapshot_buf = buf;
-
-//     ei::signal_t signal;
-//     signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-//     signal.get_data = &ei_camera_get_data;
-
-//     ei_impulse_result_t result = { 0 };
-//     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
-
-//     // Restore old pointer and free temporary buffer
-//     snapshot_buf = old_snapshot;
-//     free(buf);
-
-//     if (err != EI_IMPULSE_OK) {
-//         ei_printf("ERR: Failed to run classifier (%d)\n", err);
-//         return false;
-//     }
-
-//     // Optional: print predictions here
-//     // ...
-
-//     ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-//                 result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-// #if EI_CLASSIFIER_OBJECT_DETECTION == 1
-//     ei_printf("Object detection bounding boxes:\r\n");
-//     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
-//         ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
-//         if (bb.value == 0) {
-//             continue;
-//         }
-//         ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
-//                 bb.label,
-//                 bb.value,
-//                 bb.x,
-//                 bb.y,
-//                 bb.width,
-//                 bb.height);
-//     }
-
-//     // Print the prediction results (classification)
-// #else
-//     ei_printf("Predictions:\r\n");
-//     for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-//         ei_printf("  %s: ", ei_classifier_inferencing_categories[i]);
-//         ei_printf("%.5f\r\n", result.classification[i].value);
-//     }
-// #endif
-
-//     // Print anomaly result (if it exists)
-// #if EI_CLASSIFIER_HAS_ANOMALY
-//     ei_printf("Anomaly prediction: %.3f\r\n", result.anomaly);
-// #endif
-
-// #if EI_CLASSIFIER_HAS_VISUAL_ANOMALY
-//     ei_printf("Visual anomalies:\r\n");
-//     for (uint32_t i = 0; i < result.visual_ad_count; i++) {
-//         ei_impulse_result_bounding_box_t bb = result.visual_ad_grid_cells[i];
-//         if (bb.value == 0) {
-//             continue;
-//         }
-//         ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n", //can get bounding box
-//                 bb.label,
-//                 bb.value,
-//                 bb.x,
-//                 bb.y,
-//                 bb.width,
-//                 bb.height);
-//     }
-// #endif
-
-//     return true;
-// }
-
-
 bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
 {
-    if (!is_initialised && !ei_camera_init()) return false;
-
-    const size_t model_pixels =
-        (size_t)EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-
-    uint8_t *owned = nullptr;             // non-null only if we allocated
-    uint8_t *buf   = (uint8_t *)rgb;      // default: zero-copy
-
-    if (src_w != EI_CLASSIFIER_INPUT_WIDTH ||
-        src_h != EI_CLASSIFIER_INPUT_HEIGHT) {
-        owned = (uint8_t *)ps_malloc(model_pixels * EI_CAMERA_FRAME_BYTE_SIZE);
-        if (!owned) { ei_printf("ERR: model-input alloc failed\n"); return false; }
-        ei::image::processing::crop_and_interpolate_rgb888(
-            (uint8_t *)rgb, src_w, src_h,
-            owned,
-            EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
-        buf = owned;
+    if (!is_initialised && !ei_camera_init()) {
+        return false;
     }
 
+    // Allocate enough for raw EI size and model input size
+    size_t raw_pixels = EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
+    size_t model_pixels = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    size_t max_pixels = raw_pixels > model_pixels ? raw_pixels : model_pixels;
+
+    uint8_t *buf = (uint8_t*)ps_malloc(max_pixels * EI_CAMERA_FRAME_BYTE_SIZE);
+    if (!buf) {
+        ei_printf("ERR: Failed to allocate inference buffer\n");
+        return false;
+    }
+
+    // Copy or resize from app_http frame to EI raw size -> might have to remove this later
+    if (src_w == EI_CAMERA_RAW_FRAME_BUFFER_COLS &&
+        src_h == EI_CAMERA_RAW_FRAME_BUFFER_ROWS) {
+        memcpy(buf, rgb, raw_pixels * EI_CAMERA_FRAME_BYTE_SIZE);
+    } else {
+        ei::image::processing::crop_and_interpolate_rgb888(
+            (uint8_t*)rgb, src_w, src_h,
+            buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS);
+    }
+
+    // If the model expects a different size, resize in-place
+    if (EI_CLASSIFIER_INPUT_WIDTH != EI_CAMERA_RAW_FRAME_BUFFER_COLS ||
+        EI_CLASSIFIER_INPUT_HEIGHT != EI_CAMERA_RAW_FRAME_BUFFER_ROWS) {
+        ei::image::processing::crop_and_interpolate_rgb888(
+            buf, EI_CAMERA_RAW_FRAME_BUFFER_COLS, EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+            buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
+    }
+
+    // Point the existing get_data callback at our buffer
     uint8_t *old_snapshot = snapshot_buf;
     snapshot_buf = buf;
 
     ei::signal_t signal;
-    signal.total_length = model_pixels;
-    signal.get_data    = &ei_camera_get_data;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
 
     ei_impulse_result_t result = { 0 };
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
 
+    // Restore old pointer and free temporary buffer
     snapshot_buf = old_snapshot;
-    if (owned) free(owned);
+    free(buf);
 
     if (err != EI_IMPULSE_OK) {
-        ei_printf("ERR: run_classifier %d\n", err);
+        ei_printf("ERR: Failed to run classifier (%d)\n", err);
         return false;
     }
 
-    ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.):\n",
-              result.timing.dsp, result.timing.classification, result.timing.anomaly);
-    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        ei_printf("  %s: %.5f\n",
-                  ei_classifier_inferencing_categories[i],
-                  result.classification[i].value);
+    // Optional: print predictions here
+    // ...
+
+    ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+                result.timing.dsp, result.timing.classification, result.timing.anomaly);
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    ei_printf("Object detection bounding boxes:\r\n");
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+        ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
+        if (bb.value == 0) {
+            continue;
+        }
+        ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
+                bb.label,
+                bb.value,
+                bb.x,
+                bb.y,
+                bb.width,
+                bb.height);
     }
+
+    // Print the prediction results (classification)
+#else
+    ei_printf("Predictions:\r\n");
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        ei_printf("  %s: ", ei_classifier_inferencing_categories[i]);
+        ei_printf("%.5f\r\n", result.classification[i].value);
+    }
+#endif
+
+    // Print anomaly result (if it exists)
+#if EI_CLASSIFIER_HAS_ANOMALY
+    ei_printf("Anomaly prediction: %.3f\r\n", result.anomaly);
+#endif
+
+#if EI_CLASSIFIER_HAS_VISUAL_ANOMALY
+    ei_printf("Visual anomalies:\r\n");
+    for (uint32_t i = 0; i < result.visual_ad_count; i++) {
+        ei_impulse_result_bounding_box_t bb = result.visual_ad_grid_cells[i];
+        if (bb.value == 0) {
+            continue;
+        }
+        ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n", //can get bounding box
+                bb.label,
+                bb.value,
+                bb.x,
+                bb.y,
+                bb.width,
+                bb.height);
+    }
+#endif
+
     return true;
 }
 
