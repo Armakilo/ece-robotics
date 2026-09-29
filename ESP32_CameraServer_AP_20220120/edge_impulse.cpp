@@ -64,7 +64,7 @@ void  ei_free(void *p)              { free(p); }
 #define STOP_MIN_CONF   0.60f    // ignore weaker detections
 
 static portMUX_TYPE     stop_mux = portMUX_INITIALIZER_UNLOCKED;
-static StopSignResult   latest_stop = {false, 0, 0, 0, 0, 0};
+static StopSignResult   latest_stop = {false, 0, 0, 0, 0, 0, 0, 0, 0};
 static bool             stop_result_new = false;
 
 static uint8_t pct(uint32_t v, uint32_t full) {
@@ -72,9 +72,24 @@ static uint8_t pct(uint32_t v, uint32_t full) {
     return p > 100 ? 100 : (uint8_t)p;
 }
 
+// The model input is a centre crop of the camera frame, scaled to the model
+// size. This maps a point in model coordinates back to camera-frame pixels,
+// so it can be matched with the colour blobs (which use frame pixels).
+static void model_to_frame(float mx, float my, uint16_t *fx, uint16_t *fy)
+{
+    const float sw = EI_CAMERA_RAW_FRAME_BUFFER_COLS, sh = EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
+    const float mw = EI_CLASSIFIER_INPUT_WIDTH,       mh = EI_CLASSIFIER_INPUT_HEIGHT;
+    float crop_w = sw, crop_h = sh;
+    if (sw / sh > mw / mh) crop_w = sh * mw / mh;   // frame wider than model: crop sides
+    else                   crop_h = sw * mh / mw;   // frame taller than model: crop top/bottom
+    *fx = (uint16_t)((sw - crop_w) / 2 + mx * crop_w / mw);
+    *fy = (uint16_t)((sh - crop_h) / 2 + my * crop_h / mh);
+}
+
 static void publish_stop_result(const ei_impulse_result_t &result)
 {
-    StopSignResult r = {false, 0, 0, 0, 0, 0};
+    StopSignResult r = {false, 0, 0, 0, 0, 0, 0, 0, 0};
+    r.infer_ms = result.timing.dsp + result.timing.classification;
 
 #if EI_CLASSIFIER_OBJECT_DETECTION == 1
     uint32_t best_area = 0;
@@ -92,6 +107,7 @@ static void publish_stop_result(const ei_impulse_result_t &result)
             r.w    = pct(bb.width,  EI_CLASSIFIER_INPUT_WIDTH);
             r.h    = pct(bb.height, EI_CLASSIFIER_INPUT_HEIGHT);
             r.conf = (uint8_t)(bb.value * 100);
+            model_to_frame(bb.x + bb.width / 2.0f, bb.y + bb.height / 2.0f, &r.fx, &r.fy);
         }
     }
 #else
@@ -112,6 +128,13 @@ bool get_stop_sign_result(StopSignResult *out)
     stop_result_new = false;
     portEXIT_CRITICAL(&stop_mux);
     return fresh;
+}
+
+void peek_stop_sign_result(StopSignResult *out)
+{
+    portENTER_CRITICAL(&stop_mux);
+    *out = latest_stop;
+    portEXIT_CRITICAL(&stop_mux);
 }
 
 
@@ -175,6 +198,7 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
     // Hand the result to loop(), which forwards it to the UNO
     publish_stop_result(result);
 
+#if !LOG_CSV
     ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
                 result.timing.dsp, result.timing.classification, result.timing.anomaly);
 
@@ -223,6 +247,8 @@ bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h)
                 bb.width,
                 bb.height);
     }
+#endif
+
 #endif
 
     return true;

@@ -273,6 +273,19 @@ typedef struct
     uint32_t sum_x, sum_y;
 }blob_t;
 
+// ---- Data logging: red blob that best matches the stop sign ----
+// The FOMO box is always a fixed grid-cell size, so it can't measure how big
+// the sign is. The red blob around the same spot can: its width in pixels
+// shrinks as the sign gets further away.
+static blob_t best_red;
+static bool   best_red_valid = false;
+
+// Distance calibration: distance_cm = DIST_A * red_width_px ^ DIST_B
+// Fit these from your logged data (Excel power trendline). DIST_A = 0 means
+// "not calibrated yet" and the log shows -1 for distance.
+#define DIST_A 0.0f
+#define DIST_B -1.0f
+
 static void fresh_blob(blob_t *b, char colour)
 {
     b->x_min = UINT16_MAX;
@@ -449,7 +462,15 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
 
         }
     }
+#if !LOG_CSV
     if(blob_count > 0) Serial.println("Starting Frame Analysis");
+#endif
+
+    // for logging: pick the red blob that matches the stop sign
+    StopSignResult ss;
+    peek_stop_sign_result(&ss);
+    best_red_valid = false;
+    long best_score = -1;
     
     for(uint16_t i = 0; i < blob_count; i++){
 
@@ -459,7 +480,23 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
         blob[i].y_cent = blob[i].sum_y / blob[i].sizePX;
         blob[i].sizePX = blob[i].sizePX * I_RES * I_RES;
 
+#if !LOG_CSV
         Serial.printf("centroid of %d pixel %c object exists at (%d, %d)\n", blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent);
+#endif
+
+        if (blob[i].colour == 'R') {
+            long score;
+            if (ss.found) {
+                // prefer the red blob containing the stop sign centre, else the nearest one
+                bool contains = ss.fx >= blob[i].x_min && ss.fx <= blob[i].x_max &&
+                                ss.fy >= blob[i].y_min && ss.fy <= blob[i].y_max;
+                long dx = (long)blob[i].x_cent - ss.fx, dy = (long)blob[i].y_cent - ss.fy;
+                score = (contains ? 1000000L : 0L) + 100000L - (dx * dx + dy * dy);
+            } else {
+                score = blob[i].sizePX;   // no sign detected: log the largest red blob
+            }
+            if (score > best_score) { best_score = score; best_red = blob[i]; best_red_valid = true; }
+        }
 
         
         draw_box(img_m, blob[i], blob[i].colour);
@@ -473,6 +510,30 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
 
 
 
+
+// One CSV row per inference, for Excel Data Streamer. Columns:
+// time_ms, found, conf, x_px, y_px, fomo_w_pct, red_w_px, red_h_px, red_px, dist_cm, infer_ms
+static void log_csv_row(void)
+{
+    StopSignResult r;
+    peek_stop_sign_result(&r);
+
+    uint16_t red_w = 0, red_h = 0;
+    long red_px = 0;
+    if (best_red_valid) {
+        red_w  = best_red.x_max - best_red.x_min + I_RES;
+        red_h  = best_red.y_max - best_red.y_min + I_RES;
+        red_px = best_red.sizePX;
+    }
+
+    float dist_cm = -1;
+    if (DIST_A != 0.0f && r.found && red_w > 0)
+        dist_cm = DIST_A * powf((float)red_w, DIST_B);
+
+    Serial.printf("%lu,%d,%d,%u,%u,%u,%u,%u,%ld,%.1f,%u\r\n",
+                  (unsigned long)millis(), r.found ? 1 : 0, r.conf,
+                  r.fx, r.fy, r.w, red_w, red_h, red_px, dist_cm, r.infer_ms);
+}
 
 static void object_detect_task(void *arg){ //colour and AI image recognition
     while(1){
@@ -491,8 +552,11 @@ static void object_detect_task(void *arg){ //colour and AI image recognition
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
                 if(im){
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
-                        classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function
+                        bool ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function
                         colour_detect(im);
+#if LOG_CSV
+                        if (ok) log_csv_row();
+#endif
                     }
                     dl_matrix3du_free(im);
 

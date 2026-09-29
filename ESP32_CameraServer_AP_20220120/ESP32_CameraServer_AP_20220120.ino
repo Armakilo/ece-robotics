@@ -40,8 +40,10 @@ void SendStopSignToUno(void)
            r.found ? 1 : 0, r.cx, r.cy, r.w, r.h);
   Serial2.print(msg);
 
+#if !LOG_CSV
   if (r.found)
     Serial.printf("[STOP] cx=%u cy=%u w=%u h=%u conf=%u%%\n", r.cx, r.cy, r.w, r.h, r.conf);
+#endif
 }
 
 void SocketServer_Test(void)
@@ -64,7 +66,9 @@ void SocketServer_Test(void)
       if (client.available()) //如果有可读数据
       {
         char c = client.read();             //读取一个字节
+#if !LOG_CSV
         Serial.print(c);                    //从串口打印
+#endif
         if (true == data_begin && c == '{') //接收到开始字符
         {
           data_begin = false;
@@ -95,7 +99,9 @@ void SocketServer_Test(void)
         if (c == '}') //接收到结束字符
         {
           client.print(sendBuff);
+#if !LOG_CSV
           Serial.print(sendBuff); //从串口打印
+#endif
           sendBuff = "";
         }
       }
