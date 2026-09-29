@@ -9,13 +9,14 @@
 // 1 = the USB serial port prints ONLY CSV rows (one per inference) for
 //     Excel Data Streamer / data logging. Other debug prints are turned off.
 // 0 = normal debug prints (predictions, colour blobs, app traffic).
-#define LOG_CSV 0
+#define LOG_CSV 1
 // #define EI_TENSOR_ARENA_LOCATION ".psram"
 
 
 #define EI_CAMERA_RAW_FRAME_BUFFER_COLS           160 //might have to relplace src_w/src_h with these
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           120
 #define EI_CAMERA_FRAME_BYTE_SIZE                 3
+
 
 void start_edging(void);
 int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
@@ -24,6 +25,8 @@ void ei_camera_deinit(void);
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) ;
 void find_stop(void);
 bool classify_rgb888(const uint8_t *rgb, uint32_t src_w, uint32_t src_h);
+void SendStopSignToUno(void);
+int dist_class(uint32_t size);
 
 extern uint8_t *snapshot_buf;
 
@@ -40,6 +43,7 @@ struct StopSignResult {
     uint16_t fx;   // centre x in camera-frame pixels (160x120 frame)
     uint16_t fy;   // centre y in camera-frame pixels
     uint16_t infer_ms; // DSP + classification time for this frame
+    
 };
 
 // Copies the latest result into *out. Returns true only if a new

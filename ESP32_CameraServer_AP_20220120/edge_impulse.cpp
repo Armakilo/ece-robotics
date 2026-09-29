@@ -67,6 +67,50 @@ static portMUX_TYPE     stop_mux = portMUX_INITIALIZER_UNLOCKED;
 static StopSignResult   latest_stop = {false, 0, 0, 0, 0, 0, 0, 0, 0};
 static bool             stop_result_new = false;
 
+int dist_class(uint32_t size){
+    int dist = -1;
+    if(size > 1500){
+        return 5;
+    }
+    else if(size > 800){
+        return 10;
+    }
+    else if(size > 600){
+        return 15;
+    }
+    else if(size > 500){
+        return 20;
+    }
+    else if(size > 275){
+        return 25;
+    }
+    else{
+        return -1;
+    }
+
+    return dist;
+
+}
+
+void SendStopSignToUno(void)
+{
+  StopSignResult r;
+  if (!get_stop_sign_result(&r))
+    return;
+
+  char msg[64];
+  snprintf(msg, sizeof(msg),
+           "{\"N\":200,\"D1\":%u,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u}",
+           r.found ? 1 : 0, r.cx, r.cy, r.w, r.h);
+  Serial2.print(msg);
+
+#if !LOG_CSV
+  if (r.found)
+    Serial.printf("[STOP] cx=%u cy=%u w=%u h=%u conf=%u%%\n", r.cx, r.cy, r.w, r.h, r.conf);
+#endif
+}
+
+
 static uint8_t pct(uint32_t v, uint32_t full) {
     uint32_t p = (v * 100) / full;
     return p > 100 ? 100 : (uint8_t)p;

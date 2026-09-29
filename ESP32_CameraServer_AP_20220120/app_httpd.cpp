@@ -504,7 +504,7 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
     
     }
 
-    return * blob; //can put the 'found' or whatever bullshit in using sizeof(blob) / 28
+    return * blob;
     
 }
 
@@ -513,26 +513,32 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
 
 // One CSV row per inference, for Excel Data Streamer. Columns:
 // time_ms, found, conf, x_px, y_px, fomo_w_pct, red_w_px, red_h_px, red_px, dist_cm, infer_ms
-static void log_csv_row(void)
+static uint8_t log_csv_row(void)
 {
     StopSignResult r;
     peek_stop_sign_result(&r);
 
     uint16_t red_w = 0, red_h = 0;
     long red_px = 0;
+
+    int dist_cm = -1;
     if (best_red_valid) {
         red_w  = best_red.x_max - best_red.x_min + I_RES;
         red_h  = best_red.y_max - best_red.y_min + I_RES;
         red_px = best_red.sizePX;
+        dist_cm = dist_class(red_px);
     }
 
-    float dist_cm = -1;
-    if (DIST_A != 0.0f && r.found && red_w > 0)
-        dist_cm = DIST_A * powf((float)red_w, DIST_B);
+    
+    
+    // if (DIST_A != 0.0f && r.found && red_w > 0)
+    //     dist_cm = DIST_A * powf((float)red_w, DIST_B);
 
-    Serial.printf("%lu,%d,%d,%u,%u,%u,%u,%u,%ld,%.1f,%u\r\n",
+    Serial.printf("%lu,%d,%d,%u,%u,%u,%u,%u,%ld,%d,%u\r\n",
                   (unsigned long)millis(), r.found ? 1 : 0, r.conf,
                   r.fx, r.fy, r.w, red_w, red_h, red_px, dist_cm, r.infer_ms);
+
+    return dist_cm;
 }
 
 static void object_detect_task(void *arg){ //colour and AI image recognition
@@ -554,6 +560,7 @@ static void object_detect_task(void *arg){ //colour and AI image recognition
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
                         bool ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function
                         colour_detect(im);
+                        SendStopSignToUno();
 #if LOG_CSV
                         if (ok) log_csv_row();
 #endif
