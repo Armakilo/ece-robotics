@@ -6,6 +6,11 @@
  * @Description: Smart Robot Car V4.0
  * @FilePath: 
  */
+
+
+// Modified Oct 14, 2026 by Adam Bateman
+// Still needs to be debugged, might run into some memory issues
+
 #include <avr/wdt.h>
 //#include <hardwareSerial.h>
 #include <stdio.h>
@@ -102,28 +107,23 @@ Application_xxx Application_SmartRobotCarxxx0;
 
 //might want a struct for an obstacle
 
-struct object_t // only will really be used to track one object at a time.
+typedef struct  // only will really be used to track one object at a time.
 {
   // the raw data for the object coming in
   char type; //'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none
-
-
   uint16_t cent_x;
   uint16_t cent_y;
   uint16_t width; //estimate of width of bbox
   uint16_t height; //estimate of height of bbox unnecessary, but kept as a legacy feature
-  char colour; //colour of object, 'R' = red, 'B' = blue, 'G' = green. Based off of values sent from the ESP
+  char colour; //colour of object, 'R' = red, 'B' = blue, 'G' = green, '?' = none. Based off of values sent from the ESP
   uint16_t sizePX; //new
   uint8_t dist_cm;
-  
-  
+  unsigned long lastUpdate;
 
-  unsigned
+} object_t;
 
-}
-
-object_t obj_now
-object_t obj_prev
+object_t obj_now = {'N',0,0,0,0,'?',0,0,0};
+object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
 
 /*---------------- Stop sign (from ESP32 camera) ----------------*/
 #define STOP_SIGN_DEBUG        1     // 1 = echo to app/ESP32 monitor, 0 = off
@@ -139,7 +139,7 @@ struct StopSignData_t
 };
 StopSignData_t StopSignData = {false, 0, 0, 0, 0, 0};
 
-static bool StopSign_Triggered = false;
+static bool StopSign_Triggered = false; // just for the first case
 static unsigned long StopSign_TriggerTime = 0;
 
 static bool StopSign_Holding(void)
@@ -149,7 +149,7 @@ static bool StopSign_Holding(void)
 
 static void StopSign_Check(void)
 {
-  if (!StopSignData.found || StopSignData.w < STOP_SIGN_MIN_WIDTH)
+  if (obj_now.type != 'S')
     return;
   if (StopSign_Triggered && (millis() - StopSign_TriggerTime < STOP_SIGN_HOLD_MS + STOP_SIGN_COOLDOWN_MS))
     return; // already holding, or in cooldown
@@ -1878,7 +1878,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     {
       int control_mode_N = doc["N"];
 
-      if (control_mode_N == 200) /* stop sign data from ESP32 camera */
+      if (control_mode_N == 200) /* object sign data from ESP32 camera */
       {
         // uint8_t d1 = doc["D1"];
         // StopSignData.found = (d1 == 1);
@@ -1888,6 +1888,22 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
         // StopSignData.h = doc["D5"];
         // StopSignData.lastUpdate = millis();
         StopSignData.found = 0; //so the code dosent break
+
+        obj_prev = obj_now;
+
+        obj_now.type = doc["D1"];
+        obj_now.cent_x = doc["D2"];
+        obj_now.cent_y = doc["D3"];
+        obj_now.width = doc["D4"];
+        obj_now.height = doc["D5"];
+        obj_now.colour = doc["D7"];
+        obj_now.sizePX = doc["D8"];
+        obj_now.dist_cm = doc["D9"];
+        obj_now.lastUpdate = millis();
+
+
+
+
 
         
 

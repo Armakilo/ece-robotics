@@ -46,7 +46,7 @@ void SocketServer_Test(void)
     bool data_begin = true;
     while (client.connected()) //如果客户端处于连接状态
     {
-      SendStopSignToUno(); // loop() is blocked while the app is connected, so send from here too
+      // loop() is blocked while the app is connected, so send from here too (removed)
       if (client.available()) //如果有可读数据
       {
         char c = client.read();             //读取一个字节

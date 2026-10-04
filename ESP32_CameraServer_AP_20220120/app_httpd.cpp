@@ -24,6 +24,8 @@
 #include "fd_forward.h"
 #include "fr_forward.h"
 
+#include "app_httpd.h"
+
 
 
 #include "freertos/FreeRTOS.h"
@@ -61,15 +63,6 @@ typedef struct
     httpd_req_t *req;
     size_t len;
 } jpg_chunking_t;
-
-typedef struct
-{
-    uint16_t x;
-    uint16_t y;
-}cbank_t;
-
-
-
 
 
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -263,20 +256,14 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
 }
 
 
-typedef struct
-{
-    uint16_t x_max, y_max, x_min, y_min;
-    uint16_t x_cent;
-    uint16_t y_cent;
-    long sizePX;
-    char colour;
-    uint32_t sum_x, sum_y;
-}blob_t;
+
+
 
 // ---- Data logging: red blob that best matches the stop sign ----
 // The FOMO box is always a fixed grid-cell size, so it can't measure how big
 // the sign is. The red blob around the same spot can: its width in pixels
 // shrinks as the sign gets further away.
+// UPDATE: I replaced this with a different implementation that sends every object's data to the UNO.
 static blob_t best_red;
 static bool   best_red_valid = false;
 
@@ -285,6 +272,69 @@ static bool   best_red_valid = false;
 // "not calibrated yet" and the log shows -1 for distance.
 #define DIST_A 0.0f
 #define DIST_B -1.0f
+
+
+
+// C++ program change RGB Color
+// Model to HSV Color Model
+//#include <bits/stdc++.h>
+
+
+#include <tuple>
+
+// This RGB->HSV code was contributed by phasing17 on GeeksforGeeks
+
+hsv_t rgb_to_hsv(float r, float g, float b)
+{
+    
+    hsv_t hsv = {0,0,0};
+
+    // R, G, B values are divided by 255
+    // to change the range from 0..255 to 0..1
+    r = r / 255.0;
+    g = g / 255.0;
+    b = b / 255.0;
+
+    // h, s, v = hue, saturation, value
+    double cmax = std::max(r, std::max(g, b)); // maximum of r, g, b
+    double cmin = std::min(r, std::min(g, b)); // minimum of r, g, b
+    double diff = cmax - cmin; // diff of cmax and cmin.
+    double h = -1, s = -1;
+
+    // if cmax and cmax are equal then h = 0
+    if (cmax == cmin)
+        h = 0;
+
+    // if cmax equal r then compute h
+    else if (cmax == r)
+        h = fmod(60 * ((g - b) / diff) + 360, 360);
+
+    // if cmax equal g then compute h
+    else if (cmax == g)
+        h = fmod(60 * ((b - r) / diff) + 120, 360);
+
+    // if cmax equal b then compute h
+    else if (cmax == b)
+        h = fmod(60 * ((r - g) / diff) + 240, 360);
+
+    // if cmax equal zero
+    if (cmax == 0)
+        s = 0;
+    else
+        s = (diff / cmax) * 100;
+
+    // compute v
+    double v = cmax * 100;
+
+    
+    return {h,s,v};
+}
+
+
+
+
+
+
 
 static void fresh_blob(blob_t *b, char colour)
 {
@@ -361,10 +411,12 @@ bool is_red(uint8_t r, uint8_t g, uint8_t b) {
     if (r - b < 30) return false;
 
     return true;
+
+
 }
 
 bool is_green(uint8_t r, uint8_t g, uint8_t b) {
-    int maxc = max(r, max(g, b));
+    int maxc = max(r, max(g, b)); //old implementation.
     int minc = min(r, min(g, b));
     int diff = maxc - minc;
 
@@ -379,6 +431,8 @@ bool is_green(uint8_t r, uint8_t g, uint8_t b) {
     if (g - b < 30) return false;
 
     return true;
+
+    
 }
 
 
@@ -398,13 +452,34 @@ bool is_blue(uint8_t r, uint8_t g, uint8_t b) {
     if (b - g < 30) return false;
 
     return true;
+        
 }
 
+char find_colour(uint8_t r, uint8_t g, uint8_t b){ // New (and improved?) HSV colour detection.
+    hsv_t c_hsv = rgb_to_hsv (r,g,b);
+    if(195 <= c_hsv.H <= 285){
+        return 'B'; //blue
+    }
+    else if( 75 <= c_hsv.H <= 165){
+        return 'G'; //green
+    }
+    else if(c_hsv.H <= 30 || c_hsv.H >= 330){
+        return 'R'; //blue
+    }
+    else{
+        return '0'; //continue
+    }
+
+}
+
+blob_t current_obj;
 
 
-static bool colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in favor of a simpler apporach
+static blob_t colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in favor of a simpler apporach
     
     int blob_count = 0;
+
+    fresh_blob(&current_obj,'?');
 
     blob_t blob[MAX_BLOBS];
     
@@ -423,9 +498,10 @@ static bool colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in fa
 
             char colour = 0;       
 
-            if(is_red(r, g, b)) colour = 'R';
-            if(is_blue(r, g, b)) colour = 'B';
-            if(is_green(r, g, b)) colour = 'G';
+            // if(is_red(r, g, b)) colour = 'R';
+            // if(is_blue(r, g, b)) colour = 'B';
+            // if(is_green(r, g, b)) colour = 'G'; //old implementation
+            colour = find_colour(r, g, b);
             if(colour == 0) continue;
 
             int matchedto = -1;
@@ -469,9 +545,14 @@ static bool colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in fa
     // for logging: pick the red blob that matches the stop sign
     StopSignResult ss;
     peek_stop_sign_result(&ss);
-    best_red_valid = false;
+    //best_red_valid = false;
     long best_score = -1;
     
+
+    //largest blob finder -> record the largest blob
+    blob_t largest;
+    fresh_blob(&largest, '?');
+
     for(uint16_t i = 0; i < blob_count; i++){
 
         if(blob[i].sizePX < 30)continue;
@@ -480,31 +561,37 @@ static bool colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in fa
         blob[i].y_cent = blob[i].sum_y / blob[i].sizePX;
         blob[i].sizePX = blob[i].sizePX * I_RES * I_RES;
 
+        if(largest.sizePX < blob[i].sizePX){
+            largest = blob[i];
+        }
+
 #if !LOG_CSV
         Serial.printf("centroid of %d pixel %c object exists at (%d, %d)\n", blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent);
 #endif
 
-        if (blob[i].colour == 'R') {
-            long score;
-            if (ss.found) {
-                // prefer the red blob containing the stop sign centre, else the nearest one
-                bool contains = ss.fx >= blob[i].x_min && ss.fx <= blob[i].x_max &&
-                                ss.fy >= blob[i].y_min && ss.fy <= blob[i].y_max;
-                long dx = (long)blob[i].x_cent - ss.fx, dy = (long)blob[i].y_cent - ss.fy;
-                score = (contains ? 1000000L : 0L) + 100000L - (dx * dx + dy * dy);
-            } else {
-                score = blob[i].sizePX;   // no sign detected: log the largest red blob
-            }
-            if (score > best_score) { best_score = score; best_red = blob[i]; best_red_valid = true; }
-        }
+        // if (blob[i].colour == 'R') {
+        //     long score;
+        //     if (ss.found) {
+        //         // prefer the red blob containing the stop sign centre, else the nearest one
+        //         bool contains = ss.fx >= blob[i].x_min && ss.fx <= blob[i].x_max &&
+        //                         ss.fy >= blob[i].y_min && ss.fy <= blob[i].y_max;
+        //         long dx = (long)blob[i].x_cent - ss.fx, dy = (long)blob[i].y_cent - ss.fy;
+        //         score = (contains ? 1000000L : 0L) + 100000L - (dx * dx + dy * dy);
+        //     } else {
+        //         score = blob[i].sizePX;   // no sign detected: log the largest red blob
+        //     }
+        //     if (score > best_score) { best_score = score; best_red = blob[i]; best_red_valid = true; }
+        // } //had to take this out, does not work with current architecture
 
+        //return the red canitadate if nece
         
         draw_box(img_m, blob[i], blob[i].colour);
         draw_centroid(img_m, blob[i].x_cent, blob[i].y_cent);
     
     }
 
-    return best_red_valid; //returns true there is a stop sign conteder
+    
+    return largest; //returns true there is a stop sign conteder
     
 }
 
@@ -542,7 +629,8 @@ static uint8_t log_csv_row(void)
 }
 
 static void object_detect_task(void *arg){ //colour and AI image recognition
-    bool ok = false
+    bool ok = false;
+    bool stopsign_possible = false;
     while(1){
 
 
@@ -560,12 +648,15 @@ static void object_detect_task(void *arg){ //colour and AI image recognition
                 if(im){
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
                         
-                        stopsign_possible = colour_detect(im);
+                        blob_t the_strongest = colour_detect(im); // hehe
+                        if(the_strongest.colour == 'R'){stopsign_possible = true;}
                         if (stopsign_possible)
                         {
                             ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function, looks for a stop sign
                         }
-                        SendStopSignToUno();
+                        uint16_t dist2obj = dist_class(the_strongest.sizePX);
+                        SendObjectToUno(the_strongest, dist2obj);
+                        
 #if LOG_CSV
                         if (ok) log_csv_row();
 #endif
@@ -577,7 +668,7 @@ static void object_detect_task(void *arg){ //colour and AI image recognition
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(500)); //delay in ms between polls
+        vTaskDelay(pdMS_TO_TICKS(300)); //delay in ms between polls
     }
 }
 
