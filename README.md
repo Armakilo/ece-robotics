@@ -14,6 +14,7 @@ To Do (High Priority):
 
 
 To Do (Low Priority)
+* Convert RGB to HSV and look at hue to get a more accurate colour
 * Look into python script for processing (Adam/Greg)
 * AI rec. only works when stream is off, implement a function that can help do both
 * Calibrate colour detection better (just have to change RGB values, colour_detect() works perfectly)
