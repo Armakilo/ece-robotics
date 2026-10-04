@@ -25,10 +25,7 @@
 
 //code taken from edgeimpulse example folder then modified
 
-
-//#include "app_httpd.cpp"
-
-
+// Modified by Adam Bateman and Corey White
 
 
 #include "esp_camera.h"
@@ -92,16 +89,18 @@ int dist_class(uint32_t size){
 
 }
 
-void SendStopSignToUno(void)
+void SendStopSignToUno(void) //in the future, change this to send the largest object in the frame to the uno the largest option can be assumed to be the closest
+//figure out how to import colour of object
 {
   StopSignResult r;
   if (!get_stop_sign_result(&r))
     return;
 
-  char msg[64];
+  char msg[64]; //might need to update this later to accomidate memory
   snprintf(msg, sizeof(msg),
-           "{\"N\":200,\"D1\":%u,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u}",
-           r.found ? 1 : 0, r.cx, r.cy, r.w, r.h);
+           "{\"N\":200,\"D1\":%c,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u,\"D5\":%u,\"D5\":%u,\"D5\":%u}",
+           r.found ? 'S' : 'N', r.cx, r.cy, r.w, r.h, colour, size, distance); //changed stop sign result to send a "type" char instead. 
+           // dictionary: 'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none. 
   Serial2.print(msg);
 
 #if !LOG_CSV

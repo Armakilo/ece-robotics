@@ -97,9 +97,37 @@ struct Application_xxx
 };
 Application_xxx Application_SmartRobotCarxxx0;
 
+// red object detection and integration - still must be tested
+// need to send red object data, then check for a stop sign
+
+//might want a struct for an obstacle
+
+struct object_t // only will really be used to track one object at a time.
+{
+  // the raw data for the object coming in
+  char type; //'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none
+
+
+  uint16_t cent_x;
+  uint16_t cent_y;
+  uint16_t width; //estimate of width of bbox
+  uint16_t height; //estimate of height of bbox unnecessary, but kept as a legacy feature
+  char colour; //colour of object, 'R' = red, 'B' = blue, 'G' = green. Based off of values sent from the ESP
+  uint16_t sizePX; //new
+  uint8_t dist_cm;
+  
+  
+
+  unsigned
+
+}
+
+object_t obj_now
+object_t obj_prev
+
 /*---------------- Stop sign (from ESP32 camera) ----------------*/
 #define STOP_SIGN_DEBUG        1     // 1 = echo to app/ESP32 monitor, 0 = off
-#define STOP_SIGN_MIN_WIDTH    35    // % of image width; bigger box = closer sign. Tune this.
+#define STOP_SIGN_MIN_WIDTH    35    // % of image width; bigger box = closer sign. Tune this. //we have implemented this on the ESP. we no longer need this. replaced the send function's vals with size and height
 #define STOP_SIGN_HOLD_MS      3000  // how long to stop
 #define STOP_SIGN_COOLDOWN_MS  5000  // ignore stop signs this long after the hold, so the car can drive past
 
@@ -1852,13 +1880,17 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
 
       if (control_mode_N == 200) /* stop sign data from ESP32 camera */
       {
-        uint8_t d1 = doc["D1"];
-        StopSignData.found = (d1 == 1);
-        StopSignData.cx = doc["D2"];
-        StopSignData.cy = doc["D3"];
-        StopSignData.w = doc["D4"];
-        StopSignData.h = doc["D5"];
-        StopSignData.lastUpdate = millis();
+        // uint8_t d1 = doc["D1"];
+        // StopSignData.found = (d1 == 1);
+        // StopSignData.cx = doc["D2"];
+        // StopSignData.cy = doc["D3"];
+        // StopSignData.w = doc["D4"];
+        // StopSignData.h = doc["D5"];
+        // StopSignData.lastUpdate = millis();
+        StopSignData.found = 0; //so the code dosent break
+
+        
+
 #if STOP_SIGN_DEBUG
         if (StopSignData.found)
         {

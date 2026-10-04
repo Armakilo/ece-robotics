@@ -402,7 +402,7 @@ bool is_blue(uint8_t r, uint8_t g, uint8_t b) {
 
 
 
-static blob_t colour_detect(dl_matrix3du_t *img_m){
+static bool colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in favor of a simpler apporach
     
     int blob_count = 0;
 
@@ -504,7 +504,7 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){
     
     }
 
-    return * blob;
+    return best_red_valid; //returns true there is a stop sign conteder
     
 }
 
@@ -542,6 +542,7 @@ static uint8_t log_csv_row(void)
 }
 
 static void object_detect_task(void *arg){ //colour and AI image recognition
+    bool ok = false
     while(1){
 
 
@@ -558,8 +559,12 @@ static void object_detect_task(void *arg){ //colour and AI image recognition
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
                 if(im){
                     if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
-                        bool ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function
-                        colour_detect(im);
+                        
+                        stopsign_possible = colour_detect(im);
+                        if (stopsign_possible)
+                        {
+                            ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function, looks for a stop sign
+                        }
                         SendStopSignToUno();
 #if LOG_CSV
                         if (ok) log_csv_row();
