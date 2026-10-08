@@ -8,7 +8,7 @@ To Do (High Priority):
 * State Machine (Corey)
 * Traffic Light and stop sign management (Corey)
 * Add E-stop button, data logging/visualizing mechanism in the web client, or see if you can store the data somewhere on the robot (non-volatile) (Greg)
-* Make it so camera is no longer flipped
+* ~~Make it so camera is no longer flipped (Adam)~~
 * ~~Gate the AI processing behind a sufficiently sized colour blob being detected (Adam)~~
 * ~~Communicate object size and stop sign presence to the Elegoo board. You should not have to change the existing capture_rgb888 function other than adding the send function in the appropriate place. Also finish the rest of A2.~~
 
