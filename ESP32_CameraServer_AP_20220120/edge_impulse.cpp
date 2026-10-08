@@ -103,6 +103,7 @@ void SendObjectToUno(blob_t input, uint16_t distance) //in the future, change th
            r.found ? 'S' : 'N', input.x_cent, input.y_cent, (input.x_max-input.x_min), (input.y_max-input.y_min), input.colour, input.sizePX, distance); //changed stop sign result to send a "type" char instead. 
            // dictionary: 'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none. 
   Serial2.print(msg);
+  Serial.println(msg);
 
 #if !LOG_CSV
   if (r.found)
@@ -434,14 +435,14 @@ bool ei_camera_init(void) {
       s->set_saturation(s, 0); // lower the saturation
     }
 
-#if defined(CAMERA_MODEL_M5STACK_WIDE)
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-#elif defined(CAMERA_MODEL_ESP_EYE)
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-    s->set_awb_gain(s, 1);
-#endif
+// #if defined(CAMERA_MODEL_M5STACK_WIDE)
+//     s->set_vflip(s, 1);
+//     s->set_hmirror(s, 1);
+// #elif defined(CAMERA_MODEL_ESP_EYE)
+//     s->set_vflip(s, 1);
+//     s->set_hmirror(s, 1);
+//     s->set_awb_gain(s, 1);
+// #endif
 
     is_initialised = true;
     return true;

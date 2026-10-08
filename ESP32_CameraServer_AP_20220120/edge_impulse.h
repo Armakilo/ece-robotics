@@ -9,7 +9,7 @@
 // 1 = the USB serial port prints ONLY CSV rows (one per inference) for
 //     Excel Data Streamer / data logging. Other debug prints are turned off.
 // 0 = normal debug prints (predictions, colour blobs, app traffic).
-#define LOG_CSV 1
+#define LOG_CSV 0
 // #define EI_TENSOR_ARENA_LOCATION ".psram"
 
 

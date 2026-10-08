@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -21,73 +22,60 @@
 #include "edge_impulse.h"
 
 #include "fb_gfx.h"
-#include "fd_forward.h"
-#include "fr_forward.h"
 
 #include "app_httpd.h"
 
-
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
-#define ENROLL_CONFIRM_TIMES 5
-#define FACE_ID_SAVE_NUMBER 7
+// Face detection / recognition removed.
 
-#define FACE_COLOR_WHITE 0x00FFFFFF
-#define FACE_COLOR_BLACK 0x00000000
-#define FACE_COLOR_RED 0x000000FF
-#define FACE_COLOR_GREEN 0x0000FF00
-#define FACE_COLOR_BLUE 0x00FF0000
+#include "fd_forward.h"
+
+
+#define FACE_COLOR_WHITE  0x00FFFFFF
+#define FACE_COLOR_BLACK  0x00000000
+#define FACE_COLOR_RED    0x000000FF
+#define FACE_COLOR_GREEN  0x0000FF00
+#define FACE_COLOR_BLUE   0x00FF0000
 #define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
-#define FACE_COLOR_CYAN (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
+#define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
-#define I_RES 2
-#define DIST_THRESH 10
-#define MAX_BLOBS 6
-
-//int width, height;
+#define I_RES        2
+#define DIST_THRESH  10
+#define MAX_BLOBS    6
 
 typedef struct
 {
-    size_t size;  //number of values used for filtering
-    size_t index; //current value index
-    size_t count; //value count
-    int sum;
-    int *values; //array to be filled with values
+    size_t size;
+    size_t index;
+    size_t count;
+    int    sum;
+    int   *values;
 } ra_filter_t;
 
 typedef struct
 {
     httpd_req_t *req;
-    size_t len;
+    size_t       len;
 } jpg_chunking_t;
 
-
-static SemaphoreHandle_t camera_mutex;
-
-
+static SemaphoreHandle_t camera_mutex = NULL;
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 
 static const char *_STREAM_BOUNDARY = "\r\n";
-static const char *_STREAM_PART = "Len: %u\r\n";
+static const char *_STREAM_PART     = "Len: %u\r\n";
 
 static const char *_STREAM_BOUNDARY_test = "\r\n--" PART_BOUNDARY "\r\n";
-static const char *_STREAM_PART_test = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+static const char *_STREAM_PART_test     = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 static ra_filter_t ra_filter;
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
-
-static mtmn_config_t mtmn_config = {0};
-static int8_t detection_enabled = 0;
-static int8_t recognition_enabled = 0;
-static int8_t is_enrolling = 0;
-static face_id_list id_list = {0};
-
 
 static volatile bool stream_active = false;
 
@@ -95,20 +83,17 @@ static ra_filter_t *ra_filter_init(ra_filter_t *filter, size_t sample_size)
 {
     memset(filter, 0, sizeof(ra_filter_t));
     filter->values = (int *)malloc(sample_size * sizeof(int));
-    if (!filter->values)
-    {
+    if (!filter->values) {
         return NULL;
     }
     memset(filter->values, 0, sample_size * sizeof(int));
-
     filter->size = sample_size;
     return filter;
 }
 
 static int ra_filter_run(ra_filter_t *filter, int value)
 {
-    if (!filter->values)
-    {
+    if (!filter->values) {
         return value;
     }
     filter->sum -= filter->values[filter->index];
@@ -116,263 +101,84 @@ static int ra_filter_run(ra_filter_t *filter, int value)
     filter->sum += filter->values[filter->index];
     filter->index++;
     filter->index = filter->index % filter->size;
-    if (filter->count < filter->size)
-    {
+    if (filter->count < filter->size) {
         filter->count++;
     }
     return filter->sum / filter->count;
 }
 
-static void rgb_print(dl_matrix3du_t *image_matrix, uint32_t color, const char *str)
-{
-    fb_data_t fb;
-    fb.width = image_matrix->w;
-    fb.height = image_matrix->h;
-    fb.data = image_matrix->item;
-    fb.bytes_per_pixel = 3;
-    fb.format = FB_BGR888;
-    fb_gfx_print(&fb, (fb.width - (strlen(str) * 14)) / 2, 10, color, str);
-}
-
-static int rgb_printf(dl_matrix3du_t *image_matrix, uint32_t color, const char *format, ...)
-{
-    char loc_buf[64];
-    char *temp = loc_buf;
-    int len;
-    va_list arg;
-    va_list copy;
-    va_start(arg, format);
-    va_copy(copy, arg);
-    len = vsnprintf(loc_buf, sizeof(loc_buf), format, arg);
-    va_end(copy);
-    if (len >= sizeof(loc_buf))
-    {
-        temp = (char *)malloc(len + 1);
-        if (temp == NULL)
-        {
-            return 0;
-        }
-    }
-    vsnprintf(temp, len + 1, format, arg);
-    va_end(arg);
-    rgb_print(image_matrix, color, temp);
-    if (len > 64)
-    {
-        free(temp);
-    }
-    return len;
-}
-
-static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, int face_id)
-{
-    int x, y, w, h, i;
-    uint32_t color = FACE_COLOR_YELLOW;
-    if (face_id < 0)
-    {
-        color = FACE_COLOR_RED;
-    }
-    else if (face_id > 0)
-    {
-        color = FACE_COLOR_GREEN;
-    }
-    fb_data_t fb;
-    fb.width = image_matrix->w;
-    fb.height = image_matrix->h;
-    fb.data = image_matrix->item;
-    fb.bytes_per_pixel = 3;
-    fb.format = FB_BGR888;
-    for (i = 0; i < boxes->len; i++)
-    {
-        // rectangle box
-        x = (int)boxes->box[i].box_p[0];
-        y = (int)boxes->box[i].box_p[1];
-        w = (int)boxes->box[i].box_p[2] - x + 1;
-        h = (int)boxes->box[i].box_p[3] - y + 1;
-        fb_gfx_drawFastHLine(&fb, x, y, w, color);
-        fb_gfx_drawFastHLine(&fb, x, y + h - 1, w, color);
-        fb_gfx_drawFastVLine(&fb, x, y, h, color);
-        fb_gfx_drawFastVLine(&fb, x + w - 1, y, h, color);
-#if 0
-        // landmark
-        int x0, y0, j;
-        for (j = 0; j < 10; j+=2) {
-            x0 = (int)boxes->landmark[i].landmark_p[j];
-            y0 = (int)boxes->landmark[i].landmark_p[j+1];
-            fb_gfx_fillRect(&fb, x0, y0, 3, 3, color);
-        }
-#endif
-    }
-}
-//
-static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_boxes)
-{
-    dl_matrix3du_t *aligned_face = NULL;
-    int matched_id = 0;
-
-    aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
-    if (!aligned_face)
-    {
-        Serial.println("Could not allocate face recognition buffer");
-        return matched_id;
-    }
-    if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK)
-    {
-        if (is_enrolling == 1)
-        {
-            int8_t left_sample_face = enroll_face(&id_list, aligned_face);
-
-            if (left_sample_face == (ENROLL_CONFIRM_TIMES - 1))
-            {
-                Serial.printf("Enrolling Face ID: %d\n", id_list.tail);
-            }
-            Serial.printf("Enrolling Face ID: %d sample %d\n", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
-            rgb_printf(image_matrix, FACE_COLOR_CYAN, "ID[%u] Sample[%u]", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
-            if (left_sample_face == 0)
-            {
-                is_enrolling = 0;
-                Serial.printf("Enrolled Face ID: %d\n", id_list.tail);
-            }
-        }
-        else
-        {
-            matched_id = recognize_face(&id_list, aligned_face);
-            if (matched_id >= 0)
-            {
-                Serial.printf("Match Face ID: %u\n", matched_id);
-                rgb_printf(image_matrix, FACE_COLOR_GREEN, "Hello Subject %u", matched_id);
-            }
-            else
-            {
-                Serial.println("No Match Found");
-                rgb_print(image_matrix, FACE_COLOR_RED, "Intruder Alert!");
-                matched_id = -1;
-            }
-        }
-    }
-    else
-    {
-        Serial.println("Face Not Aligned");
-        //rgb_print(image_matrix, FACE_COLOR_YELLOW, "Human Detected");
-    }
-
-    dl_matrix3du_free(aligned_face);
-    return matched_id;
-}
-
-
-
-
-
-// ---- Data logging: red blob that best matches the stop sign ----
-// The FOMO box is always a fixed grid-cell size, so it can't measure how big
-// the sign is. The red blob around the same spot can: its width in pixels
-// shrinks as the sign gets further away.
-// UPDATE: I replaced this with a different implementation that sends every object's data to the UNO.
+// ---- Data logging placeholders ----
 static blob_t best_red;
 static bool   best_red_valid = false;
 
-// Distance calibration: distance_cm = DIST_A * red_width_px ^ DIST_B
-// Fit these from your logged data (Excel power trendline). DIST_A = 0 means
-// "not calibrated yet" and the log shows -1 for distance.
 #define DIST_A 0.0f
 #define DIST_B -1.0f
 
-
-
-// C++ program change RGB Color
-// Model to HSV Color Model
-//#include <bits/stdc++.h>
-
-
-#include <tuple>
-
-// This RGB->HSV code was contributed by phasing17 on GeeksforGeeks
-
+// ---- HSV conversion ----
 hsv_t rgb_to_hsv(float r, float g, float b)
 {
-    
-    hsv_t hsv = {0,0,0};
+    hsv_t hsv = {0, 0, 0};
 
-    // R, G, B values are divided by 255
-    // to change the range from 0..255 to 0..1
     r = r / 255.0;
     g = g / 255.0;
     b = b / 255.0;
 
-    // h, s, v = hue, saturation, value
-    float cmax = std::max(r, std::max(g, b)); // maximum of r, g, b
-    float cmin = std::min(r, std::min(g, b)); // minimum of r, g, b
-    float diff = cmax - cmin; // diff of cmax and cmin.
+    float cmax = std::max(r, std::max(g, b));
+    float cmin = std::min(r, std::min(g, b));
+    float diff = cmax - cmin;
     float h = -1, s = -1;
 
-    // if cmax and cmax are equal then h = 0
     if (cmax == cmin)
         h = 0;
-
-    // if cmax equal r then compute h
     else if (cmax == r)
         h = fmodf(60 * ((g - b) / diff) + 360, 360);
-
-    // if cmax equal g then compute h
     else if (cmax == g)
         h = fmodf(60 * ((b - r) / diff) + 120, 360);
-
-    // if cmax equal b then compute h
     else if (cmax == b)
         h = fmodf(60 * ((r - g) / diff) + 240, 360);
 
-    // if cmax equal zero
     if (cmax == 0)
         s = 0;
     else
         s = (diff / cmax);
 
-    // compute v
     float v = cmax;
 
-    
-    return {h,s,v};
+    return {h, s, v};
 }
-
-
-
-
-
-
 
 static void fresh_blob(blob_t *b, char colour)
 {
-    b->x_min = UINT16_MAX;
-    b->y_min = UINT16_MAX;
-    b->x_max = 0;
-    b->y_max = 0;
-    b->sum_x = 0;
-    b->sum_y = 0;
+    b->x_min  = UINT16_MAX;
+    b->y_min  = UINT16_MAX;
+    b->x_max  = 0;
+    b->y_max  = 0;
+    b->sum_x  = 0;
+    b->sum_y  = 0;
     b->sizePX = 0;
     b->colour = colour;
 }
 
 static void fresh_blob_at(blob_t *b, char colour, uint16_t x, uint16_t y)
 {
-    b->x_min = x;
-    b->x_max = x;
-    b->y_min = y;
-    b->y_max = y;
-    b->sum_x = x;
-    b->sum_y = y;
+    b->x_min  = x;
+    b->x_max  = x;
+    b->y_min  = y;
+    b->y_max  = y;
+    b->sum_x  = x;
+    b->sum_y  = y;
     b->sizePX = 1;
     b->colour = colour;
 }
 
-void draw_box(dl_matrix3du_t *image_matrix, blob_t box, char colour_choice){
-    
-
+void draw_box(dl_matrix3du_t *image_matrix, blob_t box, char colour_choice)
+{
     fb_data_t fb;
-    fb.width = image_matrix->w;
-    fb.height = image_matrix->h;
-    fb.data = image_matrix->item;
+    fb.width           = image_matrix->w;
+    fb.height          = image_matrix->h;
+    fb.data            = image_matrix->item;
     fb.bytes_per_pixel = 3;
-    fb.format = FB_BGR888;
+    fb.format          = FB_BGR888;
 
     int x = box.x_min;
     int y = box.y_min;
@@ -380,10 +186,9 @@ void draw_box(dl_matrix3du_t *image_matrix, blob_t box, char colour_choice){
     int h = box.y_max - box.y_min;
 
     uint32_t color = FACE_COLOR_PURPLE;
-
-    if(colour_choice == 'R') color = FACE_COLOR_RED;
-    if(colour_choice == 'G') color = FACE_COLOR_GREEN;
-    if(colour_choice == 'B') color = FACE_COLOR_BLUE;
+    if (colour_choice == 'R') color = FACE_COLOR_RED;
+    if (colour_choice == 'G') color = FACE_COLOR_GREEN;
+    if (colour_choice == 'B') color = FACE_COLOR_BLUE;
 
     fb_gfx_drawFastHLine(&fb, x, y, w, color);
     fb_gfx_drawFastHLine(&fb, x, y + h, w, color);
@@ -391,20 +196,21 @@ void draw_box(dl_matrix3du_t *image_matrix, blob_t box, char colour_choice){
     fb_gfx_drawFastVLine(&fb, x + w, y, h, color);
 }
 
-void draw_centroid(dl_matrix3du_t *image_matrix, int cx, int cy) {
+void draw_centroid(dl_matrix3du_t *image_matrix, int cx, int cy)
+{
     fb_data_t fb;
-    fb.width = image_matrix->w;
-    fb.height = image_matrix->h;
-    fb.data = image_matrix->item;
+    fb.width           = image_matrix->w;
+    fb.height          = image_matrix->h;
+    fb.data            = image_matrix->item;
     fb.bytes_per_pixel = 3;
-    fb.format = FB_BGR888;
+    fb.format          = FB_BGR888;
 
-    // Draw a small green crosshair
     fb_gfx_drawFastHLine(&fb, cx - 5, cy, 10, FACE_COLOR_GREEN);
     fb_gfx_drawFastVLine(&fb, cx, cy - 5, 10, FACE_COLOR_GREEN);
 }
 
-bool is_red(uint8_t r, uint8_t g, uint8_t b) {
+bool is_red(uint8_t r, uint8_t g, uint8_t b)
+{
     int maxc = max(r, max(g, b));
     int minc = min(r, min(g, b));
     int diff = maxc - minc;
@@ -413,129 +219,102 @@ bool is_red(uint8_t r, uint8_t g, uint8_t b) {
     if (r != maxc) return false;
     if (r - g < 30) return false;
     if (r - b < 30) return false;
-
     return true;
-
-
 }
 
-bool is_green(uint8_t r, uint8_t g, uint8_t b) {
-    int maxc = max(r, max(g, b)); //old implementation.
-    int minc = min(r, min(g, b));
-    int diff = maxc - minc;
-
-    // avoid gray/white
-    if (diff < 35) return false;
-
-    // green must be dominant
-    if (g != maxc) return false;
-
-    // green must be stronger than red/blue
-    if (g - r < 30) return false;
-    if (g - b < 30) return false;
-
-    return true;
-
-    
-}
-
-
-bool is_blue(uint8_t r, uint8_t g, uint8_t b) {
+bool is_green(uint8_t r, uint8_t g, uint8_t b)
+{
     int maxc = max(r, max(g, b));
     int minc = min(r, min(g, b));
     int diff = maxc - minc;
 
-    // avoid gray/white (low saturation)
-    if (diff < 50) return false;
-
-    // blue must be the dominant channel
-    if (b != maxc) return false;
-
-    // blue must be significantly stronger than red/green
-    if (b - r < 30) return false;
-    if (b - g < 30) return false;
-
+    if (diff < 35) return false;
+    if (g != maxc) return false;
+    if (g - r < 30) return false;
+    if (g - b < 30) return false;
     return true;
-        
 }
 
-char find_colour(uint8_t r, uint8_t g, uint8_t b){ // New (and improved?) HSV colour detection.
-    hsv_t c_hsv = rgb_to_hsv (r,g,b);
+bool is_blue(uint8_t r, uint8_t g, uint8_t b)
+{
+    int maxc = max(r, max(g, b));
+    int minc = min(r, min(g, b));
+    int diff = maxc - minc;
 
+    if (diff < 50) return false;
+    if (b != maxc) return false;
+    if (b - r < 30) return false;
+    if (b - g < 30) return false;
+    return true;
+}
 
-    if (c_hsv.V < 0.15 || c_hsv.S < 0.20){
+char find_colour(uint8_t r, uint8_t g, uint8_t b)
+{
+    hsv_t c_hsv = rgb_to_hsv(r, g, b);
+
+    if (c_hsv.V < 0.25 || c_hsv.S < 0.35) {
         return '0';
     }
 
-    if(210 <= c_hsv.H && c_hsv.H <= 270){
-        return 'B'; //blue
+    if (210 <= c_hsv.H && c_hsv.H <= 270) {
+        return 'B';
+    } else if (90 <= c_hsv.H && c_hsv.H <= 150) {   // <-- was `90 <= H <= 150`
+        return 'G';
+    } else if (c_hsv.H <= 30 || c_hsv.H >= 330) {
+        return 'R';
     }
-    else if( 90 <= c_hsv.H && c_hsv.H <= 150){
-        return 'G'; //green
-    }
-    else if(c_hsv.H <= 30 || c_hsv.H >= 330){
-        return 'R'; //red
-    }
-    else{
-        return '0'; //continue
-    }
-
+    return '0';
 }
 
 blob_t current_obj;
 
-
-static blob_t colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in favor of a simpler apporach
-    
+static blob_t colour_detect(dl_matrix3du_t *img_m)
+{
     int blob_count = 0;
 
-    fresh_blob(&current_obj,'?');
+    fresh_blob(&current_obj, '?');
 
     blob_t blob[MAX_BLOBS];
-    
-    
-    int width = img_m->w;
+
+    int width  = img_m->w;
     int height = img_m->h;
-    // I can either step through each pizel individual (using memory, or I can use a specified x/y)
-    
+
     for (int i = 0; i < MAX_BLOBS; i++) fresh_blob(&blob[i], '?');
-    for(int y = 0; y < height; y = y + I_RES){
-        for(int x = 0; x < width;  x = x + I_RES){
+
+    for (int y = 0; y < height; y = y + I_RES) {
+        for (int x = 0; x < width; x = x + I_RES) {
             uint8_t *p = img_m->item + (y * img_m->w + x) * 3;
             uint8_t b = p[0];
             uint8_t g = p[1];
-            uint8_t r = p[2];     
+            uint8_t r = p[2];
 
-            char colour = 0;       
+            //char colour = 0;  
 
             // if(is_red(r, g, b)) colour = 'R';
             // if(is_blue(r, g, b)) colour = 'B';
             // if(is_green(r, g, b)) colour = 'G'; //old implementation
-            colour = find_colour(r, g, b);
-            if(colour == 0) continue;
+
+            char colour = find_colour(r, g, b);
+            if (colour == '0') continue;
 
             int matchedto = -1;
-            for(int z = 0; z < blob_count; z++){
-                if(blob[z].colour != colour) continue;
-                if( x >= blob[z].x_min - I_RES * DIST_THRESH &&
+            for (int z = 0; z < blob_count; z++) {
+                if (blob[z].colour != colour) continue;
+                if (x >= blob[z].x_min - I_RES * DIST_THRESH &&
                     x <= blob[z].x_max + I_RES * DIST_THRESH &&
                     y >= blob[z].y_min - I_RES * DIST_THRESH &&
-                    y <= blob[z].y_max + I_RES * DIST_THRESH)
-                {
+                    y <= blob[z].y_max + I_RES * DIST_THRESH) {
                     matchedto = z;
                     break;
                 }
-
             }
 
-            if(matchedto < 0){
-                if(blob_count >= MAX_BLOBS) continue;
+            if (matchedto < 0) {
+                if (blob_count >= MAX_BLOBS) continue;
                 matchedto = blob_count++;
                 fresh_blob_at(&blob[matchedto], colour, x, y);
                 continue;
             }
-
-
             //Extend the matched blob
             blob_t *bl = &blob[matchedto]; //b1 is an alias for blob, can write stuff shorthand
             if (x < bl->x_min) bl->x_min = x;
@@ -545,71 +324,44 @@ static blob_t colour_detect(dl_matrix3du_t *img_m){ // discarded blob return in 
             bl->sum_x += x; //use -> when dealing with pointers, '.' with variables
             bl->sum_y += y;
             bl->sizePX++;
-
         }
     }
+
 #if !LOG_CSV
-    if(blob_count > 0) Serial.println("Starting Frame Analysis");
+    if (blob_count > 0) Serial.println("Starting Frame Analysis");
 #endif
 
-    // for logging: pick the red blob that matches the stop sign
     StopSignResult ss;
     peek_stop_sign_result(&ss);
-    //best_red_valid = false;
-    long best_score = -1;
-    
+
 
     //largest blob finder -> record the largest blob
     blob_t largest;
     fresh_blob(&largest, '?');
 
-    for(uint16_t i = 0; i < blob_count; i++){
-
-        if(blob[i].sizePX < 30)continue;
+    for (uint16_t i = 0; i < blob_count; i++) {
+        if (blob[i].sizePX < 30) continue;
 
         blob[i].x_cent = blob[i].sum_x / blob[i].sizePX;
         blob[i].y_cent = blob[i].sum_y / blob[i].sizePX;
         blob[i].sizePX = blob[i].sizePX * I_RES * I_RES;
 
-        if(largest.sizePX < blob[i].sizePX){
+        if (largest.sizePX < blob[i].sizePX) {
             largest = blob[i];
         }
 
 #if !LOG_CSV
-        Serial.printf("centroid of %d pixel %c object exists at (%d, %d)\n", blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent);
+        Serial.printf("centroid of %d pixel %c object exists at (%d, %d)\n",
+                      blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent);
 #endif
 
-        // if (blob[i].colour == 'R') {
-        //     long score;
-        //     if (ss.found) {
-        //         // prefer the red blob containing the stop sign centre, else the nearest one
-        //         bool contains = ss.fx >= blob[i].x_min && ss.fx <= blob[i].x_max &&
-        //                         ss.fy >= blob[i].y_min && ss.fy <= blob[i].y_max;
-        //         long dx = (long)blob[i].x_cent - ss.fx, dy = (long)blob[i].y_cent - ss.fy;
-        //         score = (contains ? 1000000L : 0L) + 100000L - (dx * dx + dy * dy);
-        //     } else {
-        //         score = blob[i].sizePX;   // no sign detected: log the largest red blob
-        //     }
-        //     if (score > best_score) { best_score = score; best_red = blob[i]; best_red_valid = true; }
-        // } //had to take this out, does not work with current architecture
-
-        //return the red canitadate if nece
-        
         draw_box(img_m, blob[i], blob[i].colour);
         draw_centroid(img_m, blob[i].x_cent, blob[i].y_cent);
-    
     }
 
-    
-    return largest; //returns true there is a stop sign conteder
-    
+    return largest;
 }
 
-
-
-
-// One CSV row per inference, for Excel Data Streamer. Columns:
-// time_ms, found, conf, x_px, y_px, fomo_w_pct, red_w_px, red_h_px, red_px, dist_cm, infer_ms
 static uint8_t log_csv_row(void)
 {
     StopSignResult r;
@@ -617,19 +369,14 @@ static uint8_t log_csv_row(void)
 
     uint16_t red_w = 0, red_h = 0;
     long red_px = 0;
-
     int dist_cm = -1;
+
     if (best_red_valid) {
-        red_w  = best_red.x_max - best_red.x_min + I_RES;
-        red_h  = best_red.y_max - best_red.y_min + I_RES;
-        red_px = best_red.sizePX;
+        red_w   = best_red.x_max - best_red.x_min + I_RES;
+        red_h   = best_red.y_max - best_red.y_min + I_RES;
+        red_px  = best_red.sizePX;
         dist_cm = dist_class(red_px);
     }
-
-    
-    
-    // if (DIST_A != 0.0f && r.found && red_w > 0)
-    //     dist_cm = DIST_A * powf((float)red_w, DIST_B);
 
     Serial.printf("%lu,%d,%d,%u,%u,%u,%u,%u,%ld,%d,%u\r\n",
                   (unsigned long)millis(), r.found ? 1 : 0, r.conf,
@@ -638,72 +385,63 @@ static uint8_t log_csv_row(void)
     return dist_cm;
 }
 
-static void object_detect_task(void *arg){ //colour and AI image recognition
+static void object_detect_task(void *arg)
+{
     bool ok = false;
     bool stopsign_possible = false;
-    Serial.println("statin task");
-    while(1){
+    Serial.println("Starting task");
+    Serial.printf("object_detect_task: camera_mutex = %p\n", camera_mutex);
 
-
-
-        if(xSemaphoreTake(camera_mutex, portMAX_DELAY)==pdTRUE){
-
-            
-            
-
-            
-            
+    while (1) {
+        ok = false;
+        stopsign_possible = false;
+        if (xSemaphoreTake(camera_mutex, portMAX_DELAY) == pdTRUE) {
             camera_fb_t *fb = esp_camera_fb_get();
-            if(fb){
+            if (fb) {
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-                if(im){
-                    if(fmt2rgb888(fb->buf, fb->len, fb->format, im->item)){
+                if (im) {
+                    if (fmt2rgb888(fb->buf, fb->len, fb->format, im->item)) {
+                        blob_t the_strongest = colour_detect(im);
+                        if (the_strongest.colour == 'R') stopsign_possible = true;
+                        Serial.println(millis());
                         
-                        blob_t the_strongest = colour_detect(im); // hehe
-                        if(the_strongest.colour == 'R'){stopsign_possible = true;}
-                        if (stopsign_possible)
-                        {
-                            ok = classify_rgb888(im->item, fb->width, fb->height); //edge impulse model function, looks for a stop sign
+                        if (stopsign_possible) {
+                            Serial.println("Classifying");
+                            ok = classify_rgb888(im->item, fb->width, fb->height);
                         }
                         uint16_t dist2obj = dist_class(the_strongest.sizePX);
                         SendObjectToUno(the_strongest, dist2obj);
-                        
+
 #if LOG_CSV
                         if (ok) log_csv_row();
 #endif
                     }
                     dl_matrix3du_free(im);
-
                 }
                 esp_camera_fb_return(fb);
-                
             }
+            xSemaphoreGive(camera_mutex);
         }
-
-        xSemaphoreGive(camera_mutex);
-        vTaskDelay(pdMS_TO_TICKS(300)); //delay in ms between polls
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
-
 
 static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len)
 {
     jpg_chunking_t *j = (jpg_chunking_t *)arg;
-    if (!index)
-    {
+    if (!index) {
         j->len = 0;
     }
-    if (httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK)
-    {
+    if (httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK) {
         return 0;
     }
     j->len += len;
     return len;
 }
-//图片帧捕获（图片）
+
+// ---- /capture : single JPEG, no face detection, no big allocations ----
 static esp_err_t capture_handler(httpd_req_t *req)
 {
-    
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
     int64_t fr_start = esp_timer_get_time();
@@ -711,283 +449,180 @@ static esp_err_t capture_handler(httpd_req_t *req)
     stream_active = true;
 
     if (xSemaphoreTake(camera_mutex, portMAX_DELAY) == pdTRUE) {
-
         fb = esp_camera_fb_get();
-        detection_enabled = 1;
-        if (!fb)
-        {
-            Serial.println("Camera capture failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-
-        httpd_resp_set_type(req, "image/jpeg");
-        httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-        size_t out_len, out_width, out_height;
-        uint8_t *out_buf;
-        bool s;
-        bool detected = false;
-        int face_id = 0;
-        if (!detection_enabled || fb->width > 400)
-        //Serial.printf("capture: %dx%d detect=%d\n", fb->width, fb->height, detection_enabled);
-        {
-            size_t fb_len = 0;
-            if (fb->format == PIXFORMAT_JPEG)
-            {
-                fb_len = fb->len;
-                res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-            }
-            else
-            {
-                jpg_chunking_t jchunk = {req, 0};
-                res = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk) ? ESP_OK : ESP_FAIL;
-                httpd_resp_send_chunk(req, NULL, 0);
-                fb_len = jchunk.len;
-            }
-            esp_camera_fb_return(fb);
-
-            stream_active = false;
-
-            int64_t fr_end = esp_timer_get_time();
-            Serial.printf("JPG: %uB %ums\n", (uint32_t)(fb_len), (uint32_t)((fr_end - fr_start) / 1000));
-            return res;
-        }
-
-        dl_matrix3du_t *image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-        if (!image_matrix)
-        {
-            esp_camera_fb_return(fb);
-            Serial.println("dl_matrix3du_alloc failed");
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-
-        out_buf = image_matrix->item;
-        out_len = fb->width * fb->height * 3;
-        out_width = fb->width;
-        out_height = fb->height;
-
-        s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-        esp_camera_fb_return(fb);
         xSemaphoreGive(camera_mutex);
-    
-    if (!s)
-    {
-        dl_matrix3du_free(image_matrix);
-        Serial.println("to rgb888 failed");
+    }
+
+    if (!fb) {
+        Serial.println("Camera capture failed");
         httpd_resp_send_500(req);
+        stream_active = false;
         return ESP_FAIL;
     }
 
-    //colour_detect(image_matrix); //old implementation, taken out for ai training
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    box_array_t *net_boxes = face_detect(image_matrix, &mtmn_config);
-
-    if (net_boxes)
-    {
-        detected = true;
-        if (recognition_enabled)
-        {
-            face_id = run_face_recognition(image_matrix, net_boxes);
-        }
-        draw_face_boxes(image_matrix, net_boxes, face_id);
-        free(net_boxes->score);
-        free(net_boxes->box);
-        free(net_boxes->landmark);
-        free(net_boxes);
+    size_t fb_len = 0;
+    if (fb->format == PIXFORMAT_JPEG) {
+        fb_len = fb->len;
+        res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    } else {
+        jpg_chunking_t jchunk = {req, 0};
+        res = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk) ? ESP_OK : ESP_FAIL;
+        httpd_resp_send_chunk(req, NULL, 0);
+        fb_len = jchunk.len;
     }
 
-    jpg_chunking_t jchunk = {req, 0};
-    s = fmt2jpg_cb(out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, jpg_encode_stream, &jchunk);
-    dl_matrix3du_free(image_matrix);
-    if (!s)
-    {
-        Serial.println("JPEG compression failed");
-        return ESP_FAIL;
-    }
-    }
+    esp_camera_fb_return(fb);
+    stream_active = false;
+
     int64_t fr_end = esp_timer_get_time();
-    Serial.printf("FACE: %uB %ums %s%d\n", (uint32_t)(jchunk.len), (uint32_t)((fr_end - fr_start) / 1000), detected ? "DETECTED " : "", face_id);
+    Serial.printf("JPG: %uB %ums\n",
+                  (uint32_t)fb_len,
+                  (uint32_t)((fr_end - fr_start) / 1000));
     return res;
 }
-//图片帧流（实时视频）AAP
+
+
 static esp_err_t stream_handler(httpd_req_t *req)
 {
-    
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
     size_t _jpg_buf_len = 0;
     uint8_t *_jpg_buf = NULL;
-    char *part_buf[64];
+    char part_buf[64];
     dl_matrix3du_t *image_matrix = NULL;
-    bool detected = false;
-    int face_id = 0;
     int64_t fr_start = 0;
-    int64_t fr_ready = 0;
-    int64_t fr_face = 0;
-    int64_t fr_recognize = 0;
-    int64_t fr_encode = 0;
 
-    detection_enabled = 1;
     static int64_t last_frame = 0;
-    if (!last_frame)
-    {
+    if (!last_frame) {
         last_frame = esp_timer_get_time();
     }
 
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK)
-    {
+    if (res != ESP_OK) {
         return res;
     }
-
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     stream_active = true;
-    if(xSemaphoreTake(camera_mutex, portMAX_DELAY) == pdTRUE)
-    {
-        while (true)
-        {
-            detected = false;
-            face_id = 0;
 
-        
+    while (true) {
+        if (xSemaphoreTake(camera_mutex, portMAX_DELAY) != pdTRUE) {
+            res = ESP_FAIL;
+            break;
+        }
 
-            fb = esp_camera_fb_get(); //获取一帧图像
-            if (!fb)
-            {
-                Serial.println("Camera capture failed");
-                res = ESP_FAIL;
-            }
-            else
-            {
-                fr_start = esp_timer_get_time();
-                fr_ready = fr_start;
-                fr_face = fr_start;
-                fr_encode = fr_start;
-                fr_recognize = fr_start;
-                if (!detection_enabled || fb->width > 400)
-                {
-                    if (fb->format != PIXFORMAT_JPEG)
-                    {
-                        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                        esp_camera_fb_return(fb);
-                        fb = NULL;
-                        if (!jpeg_converted)
-                        {
-                            Serial.println("JPEG compression failed");
-                            res = ESP_FAIL;
-                        }
-                    }
-                    else
-                    {
-                        _jpg_buf_len = fb->len;
-                        _jpg_buf = fb->buf;
-                    }
-                }
-                else
-                {
-                    image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-                    if (!image_matrix)
-                    {
-                        Serial.println("dl_matrix3du_alloc failed");
-                        res = ESP_FAIL;
-                    }
-                    else
-                    {
-                        if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item))
-                        {
-                            Serial.println("fmt2rgb888 failed");
-                            res = ESP_FAIL;
-                        }
-                        else
-                        {
-                            fr_ready = esp_timer_get_time();
-                            colour_detect(image_matrix); // draws color boxes + centroids into image_matrix
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            Serial.println("Camera capture failed");
+            xSemaphoreGive(camera_mutex);
+            res = ESP_FAIL;
+            break;
+        }
 
-                            box_array_t *net_boxes = NULL;
-                            if (detection_enabled)
-                            {
-                                net_boxes = face_detect(image_matrix, &mtmn_config);
-                            }
-                            fr_face = esp_timer_get_time();
-                            fr_recognize = fr_face;
+        fr_start = esp_timer_get_time();
 
-                            if (net_boxes)
-                            {
-                                detected = true;
-                                if (recognition_enabled)
-                                {
-                                    face_id = run_face_recognition(image_matrix, net_boxes);
-                                }
-                                fr_recognize = esp_timer_get_time();
-                                draw_face_boxes(image_matrix, net_boxes, face_id);
-                                free(net_boxes->score);
-                                free(net_boxes->box);
-                                free(net_boxes->landmark);
-                                free(net_boxes);
-                            }
-
-                            // This part re-encodes.
-                            if (!fmt2jpg(image_matrix->item,
-                                        fb->width * fb->height * 3,
-                                        fb->width, fb->height,
-                                        PIXFORMAT_RGB888, 90,
-                                        &_jpg_buf, &_jpg_buf_len))
-                            {
-                                Serial.println("fmt2jpg failed");
-                                res = ESP_FAIL;
-                            }
-                            esp_camera_fb_return(fb);
-                            fb = NULL;
-
-                        
-                            
-                            fr_encode = esp_timer_get_time();
-                        }
-                        dl_matrix3du_free(image_matrix);
-                    }
-                }
-            }
-            if (res == ESP_OK)
-            {
-                size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART_test, _jpg_buf_len);
-                res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-            }
-            if (res == ESP_OK)
-            {
-                res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len); //原始发送
-            }
-            if (res == ESP_OK)
-            {
-                res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY_test, strlen(_STREAM_BOUNDARY_test));
-            }
-
-            if (fb)
-            {
+        if (fb->width > 400) {
+            // Large frames: passthrough JPEG, no processing
+            if (fb->format != PIXFORMAT_JPEG) {
+                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
                 esp_camera_fb_return(fb);
                 fb = NULL;
-                _jpg_buf = NULL;
+                if (!jpeg_converted) {
+                    Serial.println("JPEG compression failed");
+                    xSemaphoreGive(camera_mutex);
+                    res = ESP_FAIL;
+                    break;
+                }
+            } else {
+                _jpg_buf_len = fb->len;
+                _jpg_buf     = fb->buf;
             }
-            else if (_jpg_buf)
-            {
-                free(_jpg_buf);
-                _jpg_buf = NULL;
+        } else {
+            if (!image_matrix ||
+                image_matrix->w != fb->width ||
+                image_matrix->h != fb->height) {
+                if (image_matrix) {
+                    dl_matrix3du_free(image_matrix);
+                    image_matrix = NULL;
+                }
+                image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
             }
-            if (res != ESP_OK)
-            {
+
+            if (!image_matrix) {
+                Serial.println("dl_matrix3du_alloc failed");
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                xSemaphoreGive(camera_mutex);
+                res = ESP_FAIL;
+                break;
+            }
+
+            if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item)) {
+                Serial.println("fmt2rgb888 failed");
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                xSemaphoreGive(camera_mutex);
+                res = ESP_FAIL;
+                break;
+            }
+
+            esp_camera_fb_return(fb);
+            fb = NULL;
+
+            colour_detect(image_matrix);
+
+            if (!fmt2jpg(image_matrix->item,
+                         image_matrix->w * image_matrix->h * 3,
+                         image_matrix->w, image_matrix->h,
+                         PIXFORMAT_RGB888, 90,
+                         &_jpg_buf, &_jpg_buf_len)) {
+                Serial.println("fmt2jpg failed");
+                xSemaphoreGive(camera_mutex);
+                res = ESP_FAIL;
                 break;
             }
         }
-        
+
+        xSemaphoreGive(camera_mutex);
+
+        if (res == ESP_OK) {
+            size_t hlen = snprintf(part_buf, sizeof(part_buf),
+                                   _STREAM_PART_test, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, part_buf, hlen);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        }
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY_test,
+                                        strlen(_STREAM_BOUNDARY_test));
+        }
+
+        if (fb) {
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            _jpg_buf = NULL;
+        } else if (_jpg_buf) {
+            free(_jpg_buf);
+            _jpg_buf = NULL;
+        }
+
+        if (res != ESP_OK) {
+            break;
+        }
     }
-    xSemaphoreGive(camera_mutex);
+
+    if (image_matrix) {
+        dl_matrix3du_free(image_matrix);
+        image_matrix = NULL;
+    }
+
     stream_active = false;
-    
     last_frame = 0;
-    
     return res;
 }
 
@@ -995,45 +630,32 @@ static esp_err_t cmd_handler(httpd_req_t *req)
 {
     char *buf;
     size_t buf_len;
-    char variable[32] = {
-        0,
-    };
-    char value[32] = {
-        0,
-    };
+    char variable[32] = {0};
+    char value[32]    = {0};
 
     buf_len = httpd_req_get_url_query_len(req) + 1;
-    if (buf_len > 1)
-    {
+    if (buf_len > 1) {
         buf = (char *)malloc(buf_len);
-        if (!buf)
-        {
+        if (!buf) {
             httpd_resp_send_500(req);
             return ESP_FAIL;
         }
-        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
-        {
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
             if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK &&
-                httpd_query_key_value(buf, "val", value, sizeof(value)) == ESP_OK)
-            {
-            }
-            else
-            {
+                httpd_query_key_value(buf, "val", value, sizeof(value)) == ESP_OK) {
+                // ok
+            } else {
                 free(buf);
                 httpd_resp_send_404(req);
                 return ESP_FAIL;
             }
-        }
-        else
-        {
+        } else {
             free(buf);
             httpd_resp_send_404(req);
             return ESP_FAIL;
         }
         free(buf);
-    }
-    else
-    {
+    } else {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
@@ -1044,82 +666,38 @@ static esp_err_t cmd_handler(httpd_req_t *req)
     sensor_t *s = esp_camera_sensor_get();
     int res = 0;
 
-    if (!strcmp(variable, "framesize"))
-    {
+    if (!strcmp(variable, "framesize")) {
         if (s->pixformat == PIXFORMAT_JPEG)
             res = s->set_framesize(s, (framesize_t)val);
     }
-    else if (!strcmp(variable, "quality"))
-        res = s->set_quality(s, val);
-    else if (!strcmp(variable, "contrast"))
-        res = s->set_contrast(s, val);
-    else if (!strcmp(variable, "brightness"))
-        res = s->set_brightness(s, val);
-    else if (!strcmp(variable, "saturation"))
-        res = s->set_saturation(s, val);
-    else if (!strcmp(variable, "gainceiling"))
-        res = s->set_gainceiling(s, (gainceiling_t)val);
-    else if (!strcmp(variable, "colorbar"))
-        res = s->set_colorbar(s, val);
-    else if (!strcmp(variable, "awb"))
-        res = s->set_whitebal(s, val);
-    else if (!strcmp(variable, "agc"))
-        res = s->set_gain_ctrl(s, val);
-    else if (!strcmp(variable, "aec"))
-        res = s->set_exposure_ctrl(s, val);
-    else if (!strcmp(variable, "hmirror"))
-        res = s->set_hmirror(s, val);
-    else if (!strcmp(variable, "vflip"))
-        res = s->set_vflip(s, val);
-    else if (!strcmp(variable, "awb_gain"))
-        res = s->set_awb_gain(s, val);
-    else if (!strcmp(variable, "agc_gain"))
-        res = s->set_agc_gain(s, val);
-    else if (!strcmp(variable, "aec_value"))
-        res = s->set_aec_value(s, val);
-    else if (!strcmp(variable, "aec2"))
-        res = s->set_aec2(s, val);
-    else if (!strcmp(variable, "dcw"))
-        res = s->set_dcw(s, val);
-    else if (!strcmp(variable, "bpc"))
-        res = s->set_bpc(s, val);
-    else if (!strcmp(variable, "wpc"))
-        res = s->set_wpc(s, val);
-    else if (!strcmp(variable, "raw_gma"))
-        res = s->set_raw_gma(s, val);
-    else if (!strcmp(variable, "lenc"))
-        res = s->set_lenc(s, val);
-    else if (!strcmp(variable, "special_effect"))
-        res = s->set_special_effect(s, val);
-    else if (!strcmp(variable, "wb_mode"))
-        res = s->set_wb_mode(s, val);
-    else if (!strcmp(variable, "ae_level"))
-        res = s->set_ae_level(s, val);
-    else if (!strcmp(variable, "face_detect"))
-    {
-        detection_enabled = val;
-        if (!detection_enabled)
-        {
-            recognition_enabled = 0;
-        }
-    }
-    else if (!strcmp(variable, "face_enroll"))
-        is_enrolling = val;
-    else if (!strcmp(variable, "face_recognize"))
-    {
-        recognition_enabled = val;
-        if (recognition_enabled)
-        {
-            detection_enabled = val;
-        }
-    }
-    else
-    {
+    else if (!strcmp(variable, "quality"))        res = s->set_quality(s, val);
+    else if (!strcmp(variable, "contrast"))       res = s->set_contrast(s, val);
+    else if (!strcmp(variable, "brightness"))     res = s->set_brightness(s, val);
+    else if (!strcmp(variable, "saturation"))     res = s->set_saturation(s, val);
+    else if (!strcmp(variable, "gainceiling"))    res = s->set_gainceiling(s, (gainceiling_t)val);
+    else if (!strcmp(variable, "colorbar"))       res = s->set_colorbar(s, val);
+    else if (!strcmp(variable, "awb"))            res = s->set_whitebal(s, val);
+    else if (!strcmp(variable, "agc"))            res = s->set_gain_ctrl(s, val);
+    else if (!strcmp(variable, "aec"))            res = s->set_exposure_ctrl(s, val);
+    else if (!strcmp(variable, "hmirror"))        res = s->set_hmirror(s, val);
+    else if (!strcmp(variable, "vflip"))          res = s->set_vflip(s, val);
+    else if (!strcmp(variable, "awb_gain"))       res = s->set_awb_gain(s, val);
+    else if (!strcmp(variable, "agc_gain"))       res = s->set_agc_gain(s, val);
+    else if (!strcmp(variable, "aec_value"))      res = s->set_aec_value(s, val);
+    else if (!strcmp(variable, "aec2"))           res = s->set_aec2(s, val);
+    else if (!strcmp(variable, "dcw"))            res = s->set_dcw(s, val);
+    else if (!strcmp(variable, "bpc"))            res = s->set_bpc(s, val);
+    else if (!strcmp(variable, "wpc"))            res = s->set_wpc(s, val);
+    else if (!strcmp(variable, "raw_gma"))        res = s->set_raw_gma(s, val);
+    else if (!strcmp(variable, "lenc"))           res = s->set_lenc(s, val);
+    else if (!strcmp(variable, "special_effect")) res = s->set_special_effect(s, val);
+    else if (!strcmp(variable, "wb_mode"))        res = s->set_wb_mode(s, val);
+    else if (!strcmp(variable, "ae_level"))       res = s->set_ae_level(s, val);
+    else {
         res = -1;
     }
 
-    if (res)
-    {
+    if (res) {
         return httpd_resp_send_500(req);
     }
 
@@ -1135,36 +713,34 @@ static esp_err_t status_handler(httpd_req_t *req)
     char *p = json_response;
     *p++ = '{';
 
-    p += sprintf(p, "\"framesize\":%u,", s->status.framesize);
-    p += sprintf(p, "\"quality\":%u,", s->status.quality);
-    p += sprintf(p, "\"brightness\":%d,", s->status.brightness);
-    p += sprintf(p, "\"contrast\":%d,", s->status.contrast);
-    p += sprintf(p, "\"saturation\":%d,", s->status.saturation);
-    p += sprintf(p, "\"sharpness\":%d,", s->status.sharpness);
+    p += sprintf(p, "\"framesize\":%u,",      s->status.framesize);
+    p += sprintf(p, "\"quality\":%u,",        s->status.quality);
+    p += sprintf(p, "\"brightness\":%d,",     s->status.brightness);
+    p += sprintf(p, "\"contrast\":%d,",       s->status.contrast);
+    p += sprintf(p, "\"saturation\":%d,",     s->status.saturation);
+    p += sprintf(p, "\"sharpness\":%d,",      s->status.sharpness);
     p += sprintf(p, "\"special_effect\":%u,", s->status.special_effect);
-    p += sprintf(p, "\"wb_mode\":%u,", s->status.wb_mode);
-    p += sprintf(p, "\"awb\":%u,", s->status.awb);
-    p += sprintf(p, "\"awb_gain\":%u,", s->status.awb_gain);
-    p += sprintf(p, "\"aec\":%u,", s->status.aec);
-    p += sprintf(p, "\"aec2\":%u,", s->status.aec2);
-    p += sprintf(p, "\"ae_level\":%d,", s->status.ae_level);
-    p += sprintf(p, "\"aec_value\":%u,", s->status.aec_value);
-    p += sprintf(p, "\"agc\":%u,", s->status.agc);
-    p += sprintf(p, "\"agc_gain\":%u,", s->status.agc_gain);
-    p += sprintf(p, "\"gainceiling\":%u,", s->status.gainceiling);
-    p += sprintf(p, "\"bpc\":%u,", s->status.bpc);
-    p += sprintf(p, "\"wpc\":%u,", s->status.wpc);
-    p += sprintf(p, "\"raw_gma\":%u,", s->status.raw_gma);
-    p += sprintf(p, "\"lenc\":%u,", s->status.lenc);
-    p += sprintf(p, "\"vflip\":%u,", s->status.vflip);
-    p += sprintf(p, "\"hmirror\":%u,", s->status.hmirror);
-    p += sprintf(p, "\"dcw\":%u,", s->status.dcw);
-    p += sprintf(p, "\"colorbar\":%u,", s->status.colorbar);
-    p += sprintf(p, "\"face_detect\":%u,", detection_enabled);
-    p += sprintf(p, "\"face_enroll\":%u,", is_enrolling);
-    p += sprintf(p, "\"face_recognize\":%u", recognition_enabled);
+    p += sprintf(p, "\"wb_mode\":%u,",        s->status.wb_mode);
+    p += sprintf(p, "\"awb\":%u,",            s->status.awb);
+    p += sprintf(p, "\"awb_gain\":%u,",       s->status.awb_gain);
+    p += sprintf(p, "\"aec\":%u,",            s->status.aec);
+    p += sprintf(p, "\"aec2\":%u,",           s->status.aec2);
+    p += sprintf(p, "\"ae_level\":%d,",       s->status.ae_level);
+    p += sprintf(p, "\"aec_value\":%u,",      s->status.aec_value);
+    p += sprintf(p, "\"agc\":%u,",            s->status.agc);
+    p += sprintf(p, "\"agc_gain\":%u,",       s->status.agc_gain);
+    p += sprintf(p, "\"gainceiling\":%u,",    s->status.gainceiling);
+    p += sprintf(p, "\"bpc\":%u,",            s->status.bpc);
+    p += sprintf(p, "\"wpc\":%u,",            s->status.wpc);
+    p += sprintf(p, "\"raw_gma\":%u,",        s->status.raw_gma);
+    p += sprintf(p, "\"lenc\":%u,",           s->status.lenc);
+    p += sprintf(p, "\"vflip\":%u,",          s->status.vflip);
+    p += sprintf(p, "\"hmirror\":%u,",        s->status.hmirror);
+    p += sprintf(p, "\"dcw\":%u,",            s->status.dcw);
+    p += sprintf(p, "\"colorbar\":%u",        s->status.colorbar);
     *p++ = '}';
     *p++ = 0;
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json_response, strlen(json_response));
@@ -1175,308 +751,95 @@ static esp_err_t index_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     sensor_t *s = esp_camera_sensor_get();
-    if (s->id.PID == OV3660_PID)
-    {
-        return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
+    if (s->id.PID == OV3660_PID) {
+        return httpd_resp_send(req, (const char *)index_ov3660_html_gz,
+                               index_ov3660_html_gz_len);
     }
-    return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
+    return httpd_resp_send(req, (const char *)index_ov2640_html_gz,
+                           index_ov2640_html_gz_len);
 }
-// //图片帧流（实时视频）Test
-// static esp_err_t Test_handler(httpd_req_t *req)
-// {
-//     camera_fb_t *fb = NULL;
-//     esp_err_t res = ESP_OK;
-//     size_t _jpg_buf_len = 0;
-//     uint8_t *_jpg_buf = NULL;
-//     char *part_buf[64];
-//     dl_matrix3du_t *image_matrix = NULL;
-//     bool detected = false;
-//     int face_id = 0;
-//     int64_t fr_start = 0;
-//     int64_t fr_ready = 0;
-//     int64_t fr_face = 0;
-//     int64_t fr_recognize = 0;
-//     int64_t fr_encode = 0;
-
-//     detection_enabled = 1;
-//     static int64_t last_frame = 0;
-//     if (!last_frame)
-//     {
-//         last_frame = esp_timer_get_time();
-//     }
-
-//     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-//     if (res != ESP_OK)
-//     {
-//         return res;
-//     }
-
-//     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-//     while (true)
-//     {
-//         detected = false;
-//         face_id = 0;
-//         fb = esp_camera_fb_get(); //获取一帧图像
-//         if (!fb)
-//         {
-//             Serial.println("Camera capture failed");
-//             res = ESP_FAIL;
-//         }
-//         else
-//         {
-//             fr_start = esp_timer_get_time();
-//             fr_ready = fr_start;
-//             fr_face = fr_start;
-//             fr_encode = fr_start;
-//             fr_recognize = fr_start;
-//             if (!detection_enabled || fb->width > 400)
-//             {
-//                 if (fb->format != PIXFORMAT_JPEG)
-//                 {
-//                     bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-//                     esp_camera_fb_return(fb);
-//                     fb = NULL;
-//                     if (!jpeg_converted)
-//                     {
-//                         Serial.println("JPEG compression failed");
-//                         res = ESP_FAIL;
-//                     }
-//                 }
-//                 else
-//                 {
-//                     _jpg_buf_len = fb->len;
-//                     _jpg_buf = fb->buf;
-//                 }
-//             }
-//             else
-//             {
-//                 image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-//                 if (!image_matrix)
-//                 {
-//                     Serial.println("dl_matrix3du_alloc failed");
-//                     res = ESP_FAIL;
-//                 }
-//                 else
-//                 {
-//                     if (!fmt2rgb888(fb->buf, fb->len, fb->format, image_matrix->item))
-//                     {
-//                         Serial.println("fmt2rgb888 failed");
-//                         res = ESP_FAIL;
-//                     }
-//                     else
-//                     {
-//                         fr_ready = esp_timer_get_time();
-//                         box_array_t *net_boxes = NULL;
-//                         if (detection_enabled)
-//                         {
-//                             net_boxes = face_detect(image_matrix, &mtmn_config);
-//                         }
-//                         fr_face = esp_timer_get_time();
-//                         fr_recognize = fr_face;
-//                         if (net_boxes || fb->format != PIXFORMAT_JPEG)
-//                         {
-//                             if (net_boxes)
-//                             {
-//                                 detected = true;
-//                                 if (recognition_enabled)
-//                                 {
-//                                     face_id = run_face_recognition(image_matrix, net_boxes);
-//                                 }
-//                                 fr_recognize = esp_timer_get_time();
-//                                 //rgb_printf(image_matrix, FACE_COLOR_GREEN, "Hello Subject %u", face_id);
-//                                 draw_face_boxes(image_matrix, net_boxes, face_id);
-//                                 free(net_boxes->score);
-//                                 free(net_boxes->box);
-//                                 free(net_boxes->landmark);
-//                                 free(net_boxes);
-//                             }
-//                             if (!fmt2jpg(image_matrix->item, fb->width * fb->height * 3, fb->width, fb->height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len))
-//                             {
-//                                 Serial.println("fmt2jpg failed");
-//                                 res = ESP_FAIL;
-//                             }
-//                             esp_camera_fb_return(fb);
-//                             fb = NULL;
-//                         }
-//                         else
-//                         {
-//                             _jpg_buf = fb->buf;
-//                             _jpg_buf_len = fb->len;
-//                         }
-//                         fr_encode = esp_timer_get_time();
-//                     }
-//                     dl_matrix3du_free(image_matrix);
-//                 }
-//             }
-//         }
-//         if (res == ESP_OK)
-//         {
-//             size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART_test, _jpg_buf_len);
-//             res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-//         }
-//         if (res == ESP_OK)
-//         {
-//             res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len); //原始发送
-//         }
-//         if (res == ESP_OK)
-//         {
-//             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY_test, strlen(_STREAM_BOUNDARY_test));
-//         }
-
-//         if (fb)
-//         {
-//             esp_camera_fb_return(fb);
-//             fb = NULL;
-//             _jpg_buf = NULL;
-//         }
-//         else if (_jpg_buf)
-//         {
-//             free(_jpg_buf);
-//             _jpg_buf = NULL;
-//         }
-//         if (res != ESP_OK)
-//         {
-//             break;
-//         }
-//     }
-//     last_frame = 0;
-//     return res;
-// }
 
 static esp_err_t Test1_handler(httpd_req_t *req)
 {
     Serial.println("Test1_handler...");
     char *buf;
     size_t buf_len;
-    char variable[32] = {
-        0,
-    };
-    char value[32] = {
-        0,
-    };
+    char variable[32] = {0};
+
     buf_len = httpd_req_get_url_query_len(req) + 1;
-    if (buf_len > 1)
-    {
+    if (buf_len > 1) {
         buf = (char *)malloc(buf_len);
-        if (!buf)
-        {
+        if (!buf) {
             httpd_resp_send_500(req);
             return ESP_FAIL;
         }
-        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
-        {
-            if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK)
-            {
-               // Serial2.println(variable);
-            }
-            else
-            {
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK) {
+                // ok
+            } else {
                 free(buf);
                 httpd_resp_send_404(req);
                 return ESP_FAIL;
             }
-        }
-        else
-        {
+        } else {
             free(buf);
             httpd_resp_send_404(req);
             return ESP_FAIL;
         }
         free(buf);
-    }
-    else
-    {
+    } else {
         httpd_resp_send_404(req);
         return ESP_FAIL;
     }
-
-    // httpd_resp_send(req, (const char *)"index", 5);
     return ESP_OK;
 }
 
 static esp_err_t Test2_handler(httpd_req_t *req)
 {
     Serial.println("Test2_handler...");
-
-    //  httpd_resp_send(req, (const char *)"index", 5);
     httpd_resp_send(req, (const char *)"index", 5);
     return ESP_OK;
 }
+
 void startCameraServer()
 {
-    
-    
+    // Create the mutex FIRST, before any HTTP server or task uses it.
+    camera_mutex = xSemaphoreCreateMutex();
+    if (camera_mutex == NULL) {
+        Serial.println("BAD!!!: could not create camera_mutex");
+        return;
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
     httpd_uri_t index_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = index_handler,
-        .user_ctx = NULL};
+        .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL};
 
     httpd_uri_t status_uri = {
-        .uri = "/status",
-        .method = HTTP_GET,
-        .handler = status_handler,
-        .user_ctx = NULL};
+        .uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
 
     httpd_uri_t cmd_uri = {
-        .uri = "/control",
-        .method = HTTP_GET,
-        .handler = cmd_handler,
-        .user_ctx = NULL};
+        .uri = "/control", .method = HTTP_GET, .handler = cmd_handler, .user_ctx = NULL};
 
     httpd_uri_t capture_uri = {
-        .uri = "/capture",
-        .method = HTTP_GET,
-        .handler = capture_handler,
-        .user_ctx = NULL};
+        .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL};
 
     httpd_uri_t stream_uri = {
-        .uri = "/stream",
-        .method = HTTP_GET,
-        .handler = stream_handler,
-        .user_ctx = NULL};
+        .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
 
     httpd_uri_t Test_uri = {
-        .uri = "/Test",
-        .method = HTTP_GET,
-        //.handler = Test_handler,
-        .handler = stream_handler,
-        .user_ctx = NULL};
+        .uri = "/Test", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
 
     httpd_uri_t Test1_uri = {
-        .uri = "/test1",
-        .method = HTTP_GET,
-        .handler = Test1_handler,
-        .user_ctx = NULL};
+        .uri = "/test1", .method = HTTP_GET, .handler = Test1_handler, .user_ctx = NULL};
 
     httpd_uri_t Test2_uri = {
-        .uri = "/test2",
-        .method = HTTP_GET,
-        .handler = Test2_handler,
-        .user_ctx = NULL};
+        .uri = "/test2", .method = HTTP_GET, .handler = Test2_handler, .user_ctx = NULL};
 
     ra_filter_init(&ra_filter, 20);
 
-    mtmn_config.type = FAST;
-    mtmn_config.min_face = 80;
-    mtmn_config.pyramid = 0.707;
-    mtmn_config.pyramid_times = 4;
-    mtmn_config.p_threshold.score = 0.6;
-    mtmn_config.p_threshold.nms = 0.7;
-    mtmn_config.p_threshold.candidate_number = 20;
-    mtmn_config.r_threshold.score = 0.7;
-    mtmn_config.r_threshold.nms = 0.7;
-    mtmn_config.r_threshold.candidate_number = 10;
-    mtmn_config.o_threshold.score = 0.7;
-    mtmn_config.o_threshold.nms = 0.7;
-    mtmn_config.o_threshold.candidate_number = 1;
-
-    face_id_init(&id_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
     Serial.printf("Starting web server on port: '%d'\n", config.server_port);
-    if (httpd_start(&camera_httpd, &config) == ESP_OK)
-    {
+    if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &index_uri);
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
@@ -1485,15 +848,13 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &Test1_uri);
         httpd_register_uri_handler(camera_httpd, &Test2_uri);
     }
-    config.server_port += 1; //视频流端口
+
+    config.server_port += 1;
     config.ctrl_port += 1;
     Serial.printf("Starting stream server on port: '%d'\n", config.server_port);
-    if (httpd_start(&stream_httpd, &config) == ESP_OK)
-    {
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
     }
 
-    camera_mutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(object_detect_task, "colour", 16384, NULL, 1, NULL, 0); //start executing camera task
-
+    xTaskCreatePinnedToCore(object_detect_task, "colour", 16384, NULL, 1, NULL, 0);
 }
