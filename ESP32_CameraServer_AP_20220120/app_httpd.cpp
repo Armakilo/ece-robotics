@@ -409,8 +409,11 @@ static void object_detect_task(void *arg)
                             Serial.println("Classifying");
                             ok = classify_rgb888(im->item, fb->width, fb->height);
                         }
-                        uint16_t dist2obj = dist_class(the_strongest.sizePX);
-                        SendObjectToUno(the_strongest, dist2obj);
+                        
+                        if (the_strongest.colour != '0' && the_strongest.sizePX > 0){
+                            int dist2obj = dist_class(the_strongest.sizePX);
+                            SendObjectToUno(the_strongest, dist2obj);
+                        }
 
 #if LOG_CSV
                         if (ok) log_csv_row();

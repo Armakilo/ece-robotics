@@ -64,7 +64,7 @@ static portMUX_TYPE     stop_mux = portMUX_INITIALIZER_UNLOCKED;
 static StopSignResult   latest_stop = {false, 0, 0, 0, 0, 0, 0, 0, 0};
 static bool             stop_result_new = false;
 
-uint16_t dist_class(uint32_t size)
+int dist_class(uint32_t size)
 {
     int dist = -1;
     if(size > 1500){
@@ -90,20 +90,21 @@ uint16_t dist_class(uint32_t size)
 
 }
 
-void SendObjectToUno(blob_t input, uint16_t distance) //in the future, change this to send the largest object in the frame to the uno the largest option can be assumed to be the closest
+void SendObjectToUno(blob_t input, int distance) //in the future, change this to send the largest object in the frame to the uno the largest option can be assumed to be the closest
 //figure out how to import colour of object
 {
   StopSignResult r;
-  if (!get_stop_sign_result(&r))
-    return;
+  get_stop_sign_result(&r);
+//   if (!get_stop_sign_result(&r))
+//     return;
 
-  char msg[64]; //might need to update this later to accomidate memory
+  char msg[128]; //might need to update this later to accomidate memory
   snprintf(msg, sizeof(msg),
            "{\"N\":200,\"D1\":%c,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u,\"D6\":%c,\"D7\":%u,\"D8\":%u}", //CHECK THIS TO MAKE SURE DATA IS THE SAME
            r.found ? 'S' : 'N', input.x_cent, input.y_cent, (input.x_max-input.x_min), (input.y_max-input.y_min), input.colour, input.sizePX, distance); //changed stop sign result to send a "type" char instead. 
            // dictionary: 'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none. 
   Serial2.print(msg);
-  Serial.println(msg);
+  Serial.print(msg);
 
 #if !LOG_CSV
   if (r.found)
