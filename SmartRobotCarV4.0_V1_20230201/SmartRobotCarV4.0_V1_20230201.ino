@@ -14,6 +14,7 @@ void setup()
   // put your setup code here, to run once:
   Application_FunctionSet.ApplicationFunctionSet_Init();
   wdt_enable(WDTO_2S);
+  Application_SmartRobotCarxxx0.Functional_Mode == TraceBased_mode
 }
 
 void loop()
@@ -21,12 +22,12 @@ void loop()
   //put your main code here, to run repeatedly :
   wdt_reset();
   Application_FunctionSet.ApplicationFunctionSet_SensorDataUpdate();
-  Application_FunctionSet.ApplicationFunctionSet_KeyCommand();
+  // Application_FunctionSet.ApplicationFunctionSet_KeyCommand();
   Application_FunctionSet.ApplicationFunctionSet_RGB();
-  Application_FunctionSet.ApplicationFunctionSet_Follow();
-  Application_FunctionSet.ApplicationFunctionSet_Obstacle();
+  // Application_FunctionSet.ApplicationFunctionSet_Follow();
+  // Application_FunctionSet.ApplicationFunctionSet_Obstacle();
   Application_FunctionSet.ApplicationFunctionSet_Tracking();
-  Application_FunctionSet.ApplicationFunctionSet_Rocker();
+  // Application_FunctionSet.ApplicationFunctionSet_Rocker();
   Application_FunctionSet.ApplicationFunctionSet_Standby();
   Application_FunctionSet.ApplicationFunctionSet_IRrecv();
   Application_FunctionSet.ApplicationFunctionSet_SerialPortDataAnalysis();
