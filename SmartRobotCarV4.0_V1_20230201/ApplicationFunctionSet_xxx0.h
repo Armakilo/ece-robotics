@@ -29,6 +29,7 @@ public:
   void ApplicationFunctionSet_SerialPortDataAnalysis(void);
   void ApplicationFunctionSet_IRrecv(void);
   void ApplicationFunctionSet_ForceTrackingMode(void); // put the car in line-tracking mode
+  bool ApplicationFunctionSet_EStop(void);             // IR remote emergency stop, true while engaged
 
 public: /*CMD*/
   void CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get);

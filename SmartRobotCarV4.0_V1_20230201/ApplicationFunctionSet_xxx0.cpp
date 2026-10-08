@@ -549,6 +549,30 @@ void ApplicationFunctionSet::ApplicationFunctionSet_ForceTrackingMode(void)
   Application_SmartRobotCarxxx0.Functional_Mode = TraceBased_mode;
 }
 
+/*Emergency stop: OK on the IR remote engages it, pressing OK again releases it.
+  Returns true while engaged so loop() can skip all driving code.*/
+bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
+{
+  static bool estop_active = false;
+  static unsigned long last_press = 0;
+  uint8_t IRrecv_button;
+  if (AppIRrecv.DeviceDriverSet_IRrecv_Get(&IRrecv_button /*out*/))
+  {
+    if (IRrecv_button == 5 && millis() - last_press > 300) // OK, ignore double reads of one press
+    {
+      last_press = millis();
+      estop_active = !estop_active;
+      Serial.println(estop_active ? "{E-STOP ENGAGED}" : "{E-STOP RELEASED}");
+    }
+  }
+  if (estop_active)
+  {
+    // PWM 0 and STBY LOW: motor driver disabled
+    AppMotor.DeviceDriverSet_Motor_control(direction_void, 0, direction_void, 0, control_enable);
+  }
+  return estop_active;
+}
+
 static void CMD_Lighting(uint8_t is_LightingSequence, int8_t is_LightingColorValue_R, uint8_t is_LightingColorValue_G, uint8_t is_LightingColorValue_B)
 {
   switch (is_LightingSequence)

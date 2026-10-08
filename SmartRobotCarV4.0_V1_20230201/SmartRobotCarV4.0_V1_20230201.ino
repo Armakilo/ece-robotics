@@ -26,6 +26,10 @@ void loop()
 
   Application_FunctionSet.ApplicationFunctionSet_SerialPortDataAnalysis();
 
+  // E-stop engaged (OK on the IR remote): skip tracking, red-stop logic and all motor commands
+  if (Application_FunctionSet.ApplicationFunctionSet_EStop())
+    return;
+
   // Keep the car in line-tracking mode (see the comment on this function in the .cpp)
   Application_FunctionSet.ApplicationFunctionSet_ForceTrackingMode();
 
