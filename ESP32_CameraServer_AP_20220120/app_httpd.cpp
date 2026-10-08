@@ -43,6 +43,8 @@
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
+#define STOP_CHECK_MIN_PX 150   // only run the stop sign model on red blobs at least this big
+                                // KEEP THIS EQUAL TO RED_STOP_MIN_PX ON THE UNO
 #define I_RES        2
 #define DIST_THRESH  10
 #define MAX_BLOBS    6
@@ -123,8 +125,10 @@ hsv_t rgb_to_hsv(float r, float g, float b)
     g = g / 255.0;
     b = b / 255.0;
 
-    float cmax = std::max(r, std::max(g, b));
-    float cmin = std::min(r, std::min(g, b));
+    // FIX: fd_forward.h (esp-face) #defines max() and min() as macros, which breaks
+    // std::max / std::min. fmaxf / fminf are plain float functions, so no clash.
+    float cmax = fmaxf(r, fmaxf(g, b));
+    float cmin = fminf(r, fminf(g, b));
     float diff = cmax - cmin;
     float h = -1, s = -1;
 
@@ -260,9 +264,9 @@ char find_colour(uint8_t r, uint8_t g, uint8_t b)
         return 'B';
     } else if (90 <= c_hsv.H && c_hsv.H <= 150) {   // <-- was `90 <= H <= 150`
         return 'G';
-    } else if (c_hsv.H <= 30 || c_hsv.H >= 330) {
-        return 'R';
-    }
+    } else if ((c_hsv.H <= 30 || c_hsv.H >= 330) && c_hsv.S >= 0.3) {
+    return 'R';
+}
     return '0';
 }
 
@@ -402,17 +406,32 @@ static void object_detect_task(void *arg)
                 if (im) {
                     if (fmt2rgb888(fb->buf, fb->len, fb->format, im->item)) {
                         blob_t the_strongest = colour_detect(im);
-                        if (the_strongest.colour == 'R') stopsign_possible = true;
-                        Serial.println(millis());
-                        
-                        if (stopsign_possible) {
-                            Serial.println("Classifying");
-                            ok = classify_rgb888(im->item, fb->width, fb->height);
-                        }
-                        
-                        if (the_strongest.colour != '0' && the_strongest.sizePX > 0){
-                            int dist2obj = dist_class(the_strongest.sizePX);
+                        bool has_blob = (the_strongest.sizePX > 0);
+                        int dist2obj = has_blob ? dist_class(the_strongest.sizePX) : -1;
+
+                        // CHANGED: send what we see RIGHT AWAY, before running the slow
+                        // (~1.2 s) stop sign model, so the UNO can stop on red immediately.
+                        // This message always has "D1":"N" (not checked yet).
+                        if (has_blob) {
                             SendObjectToUno(the_strongest, dist2obj);
+                        }
+
+                        // Only run the model on red blobs big enough to be a nearby sign.
+                        if (the_strongest.colour == 'R' && the_strongest.sizePX >= STOP_CHECK_MIN_PX) {
+                            stopsign_possible = true;
+                        }
+
+                        if (stopsign_possible) {
+#if !LOG_CSV
+                            Serial.println("Classifying");
+#endif
+                            ok = classify_rgb888(im->item, fb->width, fb->height);
+
+                            // CHANGED: send a second message with the model's answer:
+                            // "D1":"S" if it's a stop sign, "D1":"N" if not.
+                            if (ok) {
+                                SendObjectToUno(the_strongest, dist2obj);
+                            }
                         }
 
 #if LOG_CSV

@@ -93,21 +93,39 @@ int dist_class(uint32_t size)
 void SendObjectToUno(blob_t input, int distance) //in the future, change this to send the largest object in the frame to the uno the largest option can be assumed to be the closest
 //figure out how to import colour of object
 {
+  // FIX: only report a stop sign if the classifier ran on THIS frame and found one.
+  // get_stop_sign_result() returns true only when a new result arrived since the
+  // last call. Before, the old result was re-sent forever, so one sighting kept
+  // telling the UNO "stop sign" on every later frame.
   StopSignResult r;
-  get_stop_sign_result(&r);
-//   if (!get_stop_sign_result(&r))
-//     return;
+  bool fresh = get_stop_sign_result(&r);
+  bool stop_now = fresh && r.found;
+  // Type sent in D1:
+  //   'S' = model just ran on this frame and found a stop sign
+  //   'X' = model just ran on this frame and found NO stop sign
+  //   'N' = model didn't run on this frame (not checked)
+  char type = fresh ? (r.found ? 'S' : 'X') : 'N';
 
-  char msg[128]; //might need to update this later to accomidate memory
+  // FIX: D1 and D6 are characters, so they must be in quotes to be valid JSON.
+  // Without the quotes the UNO's ArduinoJson rejects every message.
+  // Message format (must match the UNO parser):
+  //   D1 = type   "S" stop sign, "X" checked - not a stop sign, "N" not checked
+  //   D2 = centre x (pixels, 0-159)    D3 = centre y (pixels, 0-119)
+  //   D4 = box width (pixels)          D5 = box height (pixels)
+  //   D6 = colour "R" / "G" / "B"
+  //   D7 = blob size (pixels)          D8 = distance estimate (cm, -1 = too far)
+  char msg[128];
   snprintf(msg, sizeof(msg),
-           "{\"N\":200,\"D1\":%c,\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u,\"D6\":%c,\"D7\":%u,\"D8\":%u}", //CHECK THIS TO MAKE SURE DATA IS THE SAME
-           r.found ? 'S' : 'N', input.x_cent, input.y_cent, (input.x_max-input.x_min), (input.y_max-input.y_min), input.colour, input.sizePX, distance); //changed stop sign result to send a "type" char instead. 
-           // dictionary: 'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none. 
+           "{\"N\":200,\"D1\":\"%c\",\"D2\":%u,\"D3\":%u,\"D4\":%u,\"D5\":%u,\"D6\":\"%c\",\"D7\":%ld,\"D8\":%d}",
+           type,
+           input.x_cent, input.y_cent,
+           (unsigned)(input.x_max - input.x_min), (unsigned)(input.y_max - input.y_min),
+           input.colour, input.sizePX, distance);
   Serial2.print(msg);
   Serial.print(msg);
 
 #if !LOG_CSV
-  if (r.found)
+  if (stop_now)
     Serial.printf("[STOP] cx=%u cy=%u w=%u h=%u conf=%u%%\n", r.cx, r.cy, r.w, r.h, r.conf);
 #endif
 }

@@ -117,7 +117,7 @@ typedef struct  // only will really be used to track one object at a time.
   uint16_t height; //estimate of height of bbox unnecessary, but kept as a legacy feature
   char colour; //colour of object, 'R' = red, 'B' = blue, 'G' = green, '?' = none. Based off of values sent from the ESP
   uint16_t sizePX; //new
-  uint8_t dist_cm;
+  int16_t dist_cm; // FIX: was uint8_t, but the ESP sends -1 for "too far", which became 255
   unsigned long lastUpdate;
 
 } object_t;
@@ -125,39 +125,128 @@ typedef struct  // only will really be used to track one object at a time.
 object_t obj_now = {'N',0,0,0,0,'?',0,0,0};
 object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
 
-/*---------------- Stop sign (from ESP32 camera) ----------------*/
-#define STOP_SIGN_DEBUG        1     // 1 = echo to app/ESP32 monitor, 0 = off
-#define STOP_SIGN_MIN_WIDTH    35    // % of image width; bigger box = closer sign. Tune this. //we have implemented this on the ESP. we no longer need this. replaced the send function's vals with size and height
-#define STOP_SIGN_HOLD_MS      3000  // how long to stop
-#define STOP_SIGN_COOLDOWN_MS  5000  // ignore stop signs this long after the hold, so the car can drive past
+/*---------------- Red object / stop sign logic (from ESP32 camera) ----------------
+  The ESP32 sends D1 = 'N' (not checked yet), 'S' (checked: stop sign), 'X' (checked: NOT a stop sign).
+  Flow:
+    DRIVE      -> close red object seen                        -> RED_WAIT   (stop)
+    RED_WAIT   -> camera confirms stop sign ('S')              -> SIGN_HOLD  (start 3 s timer)
+    RED_WAIT   -> camera says "not a stop sign" ('X') twice    -> RED_IGNORE (drive on)
+    RED_WAIT   -> red no longer seen                           -> DRIVE
+    RED_IGNORE -> drive, ignoring this red; a stop sign ('S')  -> SIGN_HOLD
+    RED_IGNORE -> red no longer seen                           -> DRIVE
+    SIGN_HOLD  -> 3 s passed                                   -> COOLDOWN
+    COOLDOWN   -> drive, ignore red for 5 s so we can pass the sign -> DRIVE
+*/
+#define STOP_SIGN_DEBUG        1     // 1 = print state changes, 0 = off
+#define STOP_SIGN_HOLD_MS      3000  // how long to stop at a confirmed stop sign
+#define STOP_SIGN_COOLDOWN_MS  5000  // ignore red/stop signs this long after the hold, so the car can drive past
+#define RED_FRESH_MS           2000  // red counts as "still there" if seen within this time
+                                     // (the ESP32 sends about every 0.5-1.7 s, so keep this above ~1.7 s)
+#define RED_STOP_MIN_PX        150   // stop for red blobs at least this big (= close enough).
+                                     // KEEP THIS EQUAL TO STOP_CHECK_MIN_PX ON THE ESP32
+#define RED_REJECTS_TO_GO      2     // drive on after this many "not a stop sign" answers in a row
+                                     // (1 = faster, but a stop sign missed once at a bad angle gets skipped)
 
-struct StopSignData_t
+enum RedStopState
 {
-  bool found;
-  uint8_t cx, cy, w, h; // percent of image, 0-100
-  unsigned long lastUpdate;
+  RS_DRIVE,
+  RS_RED_WAIT,
+  RS_RED_IGNORE,
+  RS_SIGN_HOLD,
+  RS_COOLDOWN
 };
-StopSignData_t StopSignData = {false, 0, 0, 0, 0, 0};
+static RedStopState red_state = RS_DRIVE;
+static unsigned long red_state_since = 0;
+static bool stop_sign_pending = false; // set when a "D1":"S" message arrives
+static uint8_t red_rejects = 0;        // "D1":"X" answers received while in RED_WAIT
 
-static bool StopSign_Triggered = false; // just for the first case
-static unsigned long StopSign_TriggerTime = 0;
-
-static bool StopSign_Holding(void)
+static void RedStop_SetState(RedStopState s)
 {
-  return StopSign_Triggered && (millis() - StopSign_TriggerTime < STOP_SIGN_HOLD_MS);
+  red_state = s;
+  red_state_since = millis();
+  red_rejects = 0;
+#if STOP_SIGN_DEBUG
+  switch (s)
+  {
+  case RS_DRIVE:      Serial.print(F("{STATE DRIVE}")); break;
+  case RS_RED_WAIT:   Serial.print(F("{STATE RED_WAIT - red seen, stopped}")); break;
+  case RS_RED_IGNORE: Serial.print(F("{STATE RED_IGNORE - not a stop sign, driving on}")); break;
+  case RS_SIGN_HOLD:  Serial.print(F("{STATE SIGN_HOLD - stop sign, 3s}")); break;
+  case RS_COOLDOWN:   Serial.print(F("{STATE COOLDOWN - driving past}")); break;
+  }
+#endif
 }
 
+// True if the camera has recently seen a red object big (= close) enough to check for a stop sign
+static bool RedAhead(void)
+{
+  return obj_now.colour == 'R' &&
+         obj_now.sizePX >= RED_STOP_MIN_PX &&
+         (millis() - obj_now.lastUpdate) < RED_FRESH_MS;
+}
+
+// Called by the message parser each time a camera message arrives
 static void StopSign_Check(void)
 {
-  if (obj_now.type != 'S')
-    return;
-  if (StopSign_Triggered && (millis() - StopSign_TriggerTime < STOP_SIGN_HOLD_MS + STOP_SIGN_COOLDOWN_MS))
-    return; // already holding, or in cooldown
-  StopSign_Triggered = true;
-  StopSign_TriggerTime = millis();
-#if STOP_SIGN_DEBUG
-  Serial.print(F("{UNO STOP HOLD}"));
-#endif
+  if (obj_now.type == 'S')
+    stop_sign_pending = true;
+  else if (obj_now.type == 'X' && red_state == RS_RED_WAIT && red_rejects < 255)
+    red_rejects++;
+}
+
+// Called every time the car is about to move. Updates the state and
+// returns true if the car must stay stopped.
+static bool RedStop_MustStop(void)
+{
+  unsigned long in_state = millis() - red_state_since;
+
+  switch (red_state)
+  {
+  case RS_DRIVE:
+    if (stop_sign_pending)
+    {
+      stop_sign_pending = false;
+      RedStop_SetState(RS_SIGN_HOLD);
+    }
+    else if (RedAhead())
+      RedStop_SetState(RS_RED_WAIT);
+    break;
+
+  case RS_RED_WAIT:
+    if (stop_sign_pending)
+    {
+      stop_sign_pending = false;
+      RedStop_SetState(RS_SIGN_HOLD); // confirmed: start the 3 s timer now
+    }
+    else if (red_rejects >= RED_REJECTS_TO_GO)
+      RedStop_SetState(RS_RED_IGNORE); // background red, not a stop sign
+    else if (!RedAhead())
+      RedStop_SetState(RS_DRIVE); // red went away without being a stop sign
+    break;
+
+  case RS_RED_IGNORE:
+    if (stop_sign_pending)
+    {
+      stop_sign_pending = false;
+      RedStop_SetState(RS_SIGN_HOLD); // a real stop sign showed up
+    }
+    else if (!RedAhead())
+      RedStop_SetState(RS_DRIVE); // that red is out of view, watch for new red again
+    break;
+
+  case RS_SIGN_HOLD:
+    if (in_state >= STOP_SIGN_HOLD_MS)
+      RedStop_SetState(RS_COOLDOWN);
+    break;
+
+  case RS_COOLDOWN:
+    stop_sign_pending = false; // ignore the sign we're driving past
+    if (in_state >= STOP_SIGN_COOLDOWN_MS)
+      RedStop_SetState(RS_DRIVE);
+    break;
+  }
+
+  return red_state == RS_RED_WAIT || red_state == RS_SIGN_HOLD;
 }
 
 bool ApplicationFunctionSet_SmartRobotCarLeaveTheGround(void);
@@ -272,7 +361,7 @@ static void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotio
   uint8_t Kp, UpperLimit;
   uint8_t speed = is_speed;
 
-  if (direction != stop_it && StopSign_Holding()) // stop sign: override any movement
+  if (direction != stop_it && RedStop_MustStop()) // red object / stop sign: override any movement
   {
     direction = stop_it;
   }
@@ -445,6 +534,19 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SensorDataUpdate(void)
 void ApplicationFunctionSet::ApplicationFunctionSet_Bootup(void)
 {
   Application_SmartRobotCarxxx0.Functional_Mode = Standby_mode;
+}
+
+/*
+  FIX: the .ino tried to set Application_SmartRobotCarxxx0.Functional_Mode directly,
+  but that variable and TraceBased_mode only exist inside this .cpp file, so the
+  sketch didn't compile. The .ino calls this function instead.
+  It's called every loop on purpose: the ESP32 sends {"N":100} ("stop, go to standby")
+  whenever no phone app is connected, which would otherwise knock the car out of
+  line-tracking mode.
+*/
+void ApplicationFunctionSet::ApplicationFunctionSet_ForceTrackingMode(void)
+{
+  Application_SmartRobotCarxxx0.Functional_Mode = TraceBased_mode;
 }
 
 static void CMD_Lighting(uint8_t is_LightingSequence, int8_t is_LightingColorValue_R, uint8_t is_LightingColorValue_G, uint8_t is_LightingColorValue_B)
@@ -1862,11 +1964,13 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     //   SerialPortData = "";
     //   return;
     // }
-    // if (true == SerialPortData.equals("{Factory}") || true == SerialPortData.equals("{WA_NO}") || true == SerialPortData.equals("{WA_OK}")) 
-    // {
-    //   SerialPortData = "";
-    //   return;
-    // }
+    // ESP32 status messages that aren't JSON commands - ignore them
+    if (SerialPortData.equals("{Factory}") || SerialPortData.equals("{WA_NO}") ||
+        SerialPortData.equals("{WA_OK}"))
+    {
+      SerialPortData = "";
+      return;
+    }
     StaticJsonDocument<200> doc;                                       //Declare a JsonDocument object
     DeserializationError error = deserializeJson(doc, SerialPortData); //Deserialize JSON data from the serial data buffer
     SerialPortData = "";
@@ -1880,42 +1984,39 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
 
       if (control_mode_N == 200) /* object sign data from ESP32 camera */
       {
-        // uint8_t d1 = doc["D1"];
-        // StopSignData.found = (d1 == 1);
-        // StopSignData.cx = doc["D2"];
-        // StopSignData.cy = doc["D3"];
-        // StopSignData.w = doc["D4"];
-        // StopSignData.h = doc["D5"];
-        // StopSignData.lastUpdate = millis();
-        StopSignData.found = 0; //so the code dosent break
-
         obj_prev = obj_now;
 
-        obj_now.type = doc["D1"];
+        // FIX: D1 and D6 arrive as one-letter strings ("S", "R"). Assigning
+        // doc["D1"] straight to a char gives 0, so read the first letter of the string.
+        // FIX: keys now match what the ESP32 sends: D6 colour, D7 size, D8 distance
+        // (before, the UNO read D7/D8/D9, which were all off by one).
+        const char *type_str = doc["D1"];
+        const char *colour_str = doc["D6"];
+        obj_now.type = type_str ? type_str[0] : 'N';
         obj_now.cent_x = doc["D2"];
         obj_now.cent_y = doc["D3"];
         obj_now.width = doc["D4"];
         obj_now.height = doc["D5"];
-        obj_now.colour = doc["D7"];
-        obj_now.sizePX = doc["D8"];
-        obj_now.dist_cm = doc["D9"];
+        obj_now.colour = colour_str ? colour_str[0] : '?';
+        obj_now.sizePX = doc["D7"];
+        obj_now.dist_cm = doc["D8"];
         obj_now.lastUpdate = millis();
-
-
 
 
 
         
 
 #if STOP_SIGN_DEBUG
-        if (StopSignData.found)
-        {
-          Serial.print(F("{UNO stop x="));
-          Serial.print(StopSignData.cx);
-          Serial.print(F(" w="));
-          Serial.print(StopSignData.w);
-          Serial.print('}');
-        }
+        // Echo every camera message the UNO understood, so you can check the link
+        Serial.print(F("{UNO rx type="));
+        Serial.print(obj_now.type);
+        Serial.print(F(" col="));
+        Serial.print(obj_now.colour);
+        Serial.print(F(" x="));
+        Serial.print(obj_now.cent_x);
+        Serial.print(F(" d="));
+        Serial.print(obj_now.dist_cm);
+        Serial.print('}');
 #endif
         StopSign_Check();
         return; // don't touch CommandSerialNumber
