@@ -24,6 +24,7 @@
 #include "fb_gfx.h"
 
 #include "app_httpd.h"
+#include "telemetry.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -833,6 +834,7 @@ void startCameraServer()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16; // default is 8, the data logger adds 4 more
 
     httpd_uri_t index_uri = {
         .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL};
@@ -869,6 +871,7 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &Test_uri);
         httpd_register_uri_handler(camera_httpd, &Test1_uri);
         httpd_register_uri_handler(camera_httpd, &Test2_uri);
+        telemetry_register_handlers(camera_httpd); // /data, /log.csv, /log_clear, /estop
     }
 
     config.server_port += 1;

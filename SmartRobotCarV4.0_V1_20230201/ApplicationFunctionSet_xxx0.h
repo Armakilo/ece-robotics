@@ -29,7 +29,8 @@ public:
   void ApplicationFunctionSet_SerialPortDataAnalysis(void);
   void ApplicationFunctionSet_IRrecv(void);
   void ApplicationFunctionSet_ForceTrackingMode(void); // put the car in line-tracking mode
-  bool ApplicationFunctionSet_EStop(void);             // IR remote emergency stop, true while engaged
+  bool ApplicationFunctionSet_EStop(void);             // web page emergency stop, true while engaged
+  void ApplicationFunctionSet_Telemetry(bool estop_active); // send heading/state to the ESP32 logger
 
 public: /*CMD*/
   void CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get);
@@ -117,4 +118,5 @@ private:
   uint8_t CMD_is_FastLED_setBrightness = 20;
 };
 extern ApplicationFunctionSet Application_FunctionSet;
+extern float Heading_Predicted; // degrees, from the kinematic model; logged by ApplicationFunctionSet_Telemetry
 #endif

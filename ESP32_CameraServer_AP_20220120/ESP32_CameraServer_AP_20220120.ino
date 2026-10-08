@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "edge_impulse.h"
+#include "telemetry.h"
 WiFiServer server(100);
 
 #define RXD2 33
@@ -82,6 +83,7 @@ void SocketServer_Test(void)
         sendBuff += c;
         if (c == '}') //接收到结束字符
         {
+          telemetry_handle_uno_msg(sendBuff);
           client.print(sendBuff);
 #if !LOG_CSV
           Serial.print(sendBuff); //从串口打印
@@ -147,6 +149,7 @@ void FactoryTest(void)
     readBuff += c;
     if (c == '}') //接收到结束字符
     {
+      telemetry_handle_uno_msg(readBuff);
       if (true == readBuff.equals("{BT_detection}"))
       {
         Serial2.print("{BT_OK}");
@@ -204,7 +207,9 @@ void setup()
   Serial.printf("Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   Serial.printf("Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   Serial.begin(9600);
+  Serial2.setRxBufferSize(1024); // room for UNO messages while a log download blocks loop()
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  telemetry_init();
   //http://192.168.4.1/control?var=framesize&val=3
   //http://192.168.4.1/Test?var=
   CameraWebServerAP.CameraWebServer_AP_Init();

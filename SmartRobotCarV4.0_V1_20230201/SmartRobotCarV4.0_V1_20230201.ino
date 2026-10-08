@@ -26,8 +26,13 @@ void loop()
 
   Application_FunctionSet.ApplicationFunctionSet_SerialPortDataAnalysis();
 
-  // E-stop engaged (OK on the IR remote): skip tracking, red-stop logic and all motor commands
-  if (Application_FunctionSet.ApplicationFunctionSet_EStop())
+  // E-stop engaged (E-STOP button on the web page): skip tracking, red-stop logic and all motor commands
+  bool estop = Application_FunctionSet.ApplicationFunctionSet_EStop();
+
+  // Send heading + state to the ESP32 data logger (keeps running during an E-stop)
+  Application_FunctionSet.ApplicationFunctionSet_Telemetry(estop);
+
+  if (estop)
     return;
 
   // Keep the car in line-tracking mode (see the comment on this function in the .cpp)

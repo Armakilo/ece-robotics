@@ -156,6 +156,16 @@ enum RedStopState
   RS_COOLDOWN
 };
 static RedStopState red_state = RS_DRIVE;
+
+// What the line tracker is doing (for telemetry)
+enum TrackState
+{
+  TS_FOLLOW, // on the line
+  TS_SEARCH, // lost the line, sweeping left/right to find it
+  TS_LOST,   // sweep failed, stopped
+  TS_LIFTED  // all sensors see nothing: car picked up
+};
+static TrackState track_state = TS_FOLLOW;
 static unsigned long red_state_since = 0;
 static bool stop_sign_pending = false; // set when a "D1":"S" message arrives
 static uint8_t red_rejects = 0;        // "D1":"X" answers received while in RED_WAIT
@@ -549,28 +559,65 @@ void ApplicationFunctionSet::ApplicationFunctionSet_ForceTrackingMode(void)
   Application_SmartRobotCarxxx0.Functional_Mode = TraceBased_mode;
 }
 
-/*Emergency stop: OK on the IR remote engages it, pressing OK again releases it.
+/*Emergency stop: set by the web page's E-STOP button, which the ESP32 sends as
+  {"N":300,"D1":1} (engage) or {"N":300,"D1":0} (release), see SerialPortDataAnalysis.
   Returns true while engaged so loop() can skip all driving code.*/
+static bool estop_active = false;
 bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
 {
-  static bool estop_active = false;
-  static unsigned long last_press = 0;
-  uint8_t IRrecv_button;
-  if (AppIRrecv.DeviceDriverSet_IRrecv_Get(&IRrecv_button /*out*/))
-  {
-    if (IRrecv_button == 5 && millis() - last_press > 300) // OK, ignore double reads of one press
-    {
-      last_press = millis();
-      estop_active = !estop_active;
-      Serial.println(estop_active ? "{E-STOP ENGAGED}" : "{E-STOP RELEASED}");
-    }
-  }
   if (estop_active)
   {
     // PWM 0 and STBY LOW: motor driver disabled
     AppMotor.DeviceDriverSet_Motor_control(direction_void, 0, direction_void, 0, control_enable);
   }
   return estop_active;
+}
+
+float Heading_Predicted = NAN; // degrees, set this from the kinematic model (blank in the log until set)
+
+/*Telemetry for the ESP32 data logger, 5x per second:
+    {T,time_ms,heading_actual,heading_predicted,state}
+  Headings are sent in tenths of a degree (the ESP32 converts back) to avoid the float print code.
+  heading_actual is the integrated gyro yaw (0 at power-on).*/
+void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
+{
+  static unsigned long last_send = 0;
+  static float heading_actual = 0;
+  AppMPU6050getdata.MPU6050_dveGetEulerAngles(&heading_actual); // integrate the gyro every loop, not just when sending
+  if (millis() - last_send < 200)
+    return;
+  last_send = millis();
+
+  const __FlashStringHelper *state;
+  if (estop_active)
+    state = F("ESTOP");
+  else if (red_state == RS_RED_WAIT)
+    state = F("RED_WAIT");
+  else if (red_state == RS_SIGN_HOLD)
+    state = F("STOP_SIGN");
+  else if (track_state == TS_LIFTED)
+    state = F("LIFTED");
+  else if (track_state == TS_SEARCH)
+    state = F("LINE_SEARCH");
+  else if (track_state == TS_LOST)
+    state = F("LINE_LOST");
+  else if (red_state == RS_RED_IGNORE)
+    state = F("RED_IGNORE");
+  else if (red_state == RS_COOLDOWN)
+    state = F("COOLDOWN");
+  else
+    state = F("LINE_FOLLOW");
+
+  Serial.print(F("{T,"));
+  Serial.print(last_send);
+  Serial.print(',');
+  Serial.print((long)(heading_actual * 10));
+  Serial.print(',');
+  if (!isnan(Heading_Predicted))
+    Serial.print((long)(Heading_Predicted * 10));
+  Serial.print(',');
+  Serial.print(state);
+  Serial.print('}');
 }
 
 static void CMD_Lighting(uint8_t is_LightingSequence, int8_t is_LightingColorValue_R, uint8_t is_LightingColorValue_G, uint8_t is_LightingColorValue_B)
@@ -758,9 +805,11 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   {
     if (Car_LeaveTheGround == false) //Check if the car leaves the ground
     {
+      track_state = TS_LIFTED;
       ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
       return;
     }
+    track_state = TS_FOLLOW; // changed below if the line is lost
 
     // int getAnaloguexxx_L = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_L();
     // int getAnaloguexxx_M = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_M();
@@ -801,6 +850,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
     }
     else ////The car is not on the black line. execute Blind scan
     {
+      track_state = BlindDetection ? TS_SEARCH : TS_LOST;
       if (timestamp == true) //acquire timestamp
       {
         timestamp = false;
@@ -2005,6 +2055,13 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     else if (!error) //Check if the deserialization is successful
     {
       int control_mode_N = doc["N"];
+
+      if (control_mode_N == 300) /* E-stop from the web page: D1 1 = engage, 0 = release */
+      {
+        estop_active = doc["D1"];
+        Serial.println(estop_active ? F("{E-STOP ENGAGED}") : F("{E-STOP RELEASED}"));
+        return; // don't touch CommandSerialNumber
+      }
 
       if (control_mode_N == 200) /* object sign data from ESP32 camera */
       {
