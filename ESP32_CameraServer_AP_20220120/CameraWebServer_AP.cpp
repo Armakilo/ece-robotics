@@ -103,6 +103,13 @@ void CameraWebServer_AP::CameraWebServer_AP_Init(void)
   s->set_vflip(s, 0);   //图片方向设置（上下）
   s->set_hmirror(s, 0); //图片方向设置（左右）
 
+  // Colour tuning for red detection: with the default settings the stop sign was
+  // overexposed (V ~0.9) and read as pale pink (S ~0.3), so most of it wasn't "red".
+  // Same as /control?var=ae_level&val=-2 and /control?var=saturation&val=2,
+  // but applied at every boot. Range for both is -2..2.
+  s->set_ae_level(s, -2);   // darker exposure
+  s->set_saturation(s, 2);  // stronger colours
+
   // s->set_vflip(s, 1);   //图片方向设置（上下）
   // s->set_hmirror(s, 1); //图片方向设置（左右）
 

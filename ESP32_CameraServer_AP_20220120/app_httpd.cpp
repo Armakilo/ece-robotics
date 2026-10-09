@@ -44,11 +44,40 @@
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
-#define STOP_CHECK_MIN_PX 150   // only run the stop sign model on red blobs at least this big
+#define STOP_CHECK_MIN_PX 100   // only run the stop sign model on red blobs at least this big
                                 // KEEP THIS EQUAL TO RED_STOP_MIN_PX ON THE UNO
+                                // (was 150: glare makes the sign count fewer red pixels, so it
+                                //  only reached 150 when the car was already too close)
+#define DETECT_DELAY_MS   100   // pause between detection frames (was 500)
+
 #define I_RES        2
 #define DIST_THRESH  10
 #define MAX_BLOBS    6
+
+// ---- Red colour thresholds (FIX 2) ----
+// Red is stricter than green/blue because orange, skin, wood and warm light were
+// passing as red. Measure your sign with HSV_PROBE below and adjust these.
+// (first try was 12 / 345 / 0.50 / 0.30 - too strict, missed the sign)
+#define RED_HUE_LOW_MAX   20     // red if hue <= this ...
+#define RED_HUE_HIGH_MIN  340    // ... or hue >= this (red wraps around 0/360)
+#define RED_MIN_SAT       0.40f  // raise to reject pinkish / washed-out red, lower if the sign is missed
+#define RED_MIN_VAL       0.25f  // raise to reject dark reddish shadows
+
+// 1 = every ~1 s, print the H/S/V of the centre pixel (draws a white cross there
+//     on the /stream view). Point the centre of the camera at the sign, then at
+//     whatever causes false stops, and set the RED_ thresholds between the two.
+// 0 = off (normal running)
+#define HSV_PROBE         1      // ON for tuning - set back to 0 when the thresholds are right
+
+// ---- Red blob shape filter (FIX 3) ----
+// A real sign is a solid, roughly square blob. Lighting noise and distant objects
+// make sparse, stretched blobs that used to add up past STOP_CHECK_MIN_PX.
+#define RED_MIN_FILL      0.15f  // red pixels must cover at least this much of the blob's box
+                                 // (measured: the real sign reads 0.22; tried 0.40 and 0.30, both rejected it)
+#define RED_MIN_ASPECT    0.30f  // allowed box width/height ratio - only rejects thin strips (tape, edges)
+#define RED_MAX_ASPECT    3.30f  // (skipped when the box touches the frame edge, i.e. sign is very close)
+                                 // first try was 0.60-1.60, but glare makes only part of the sign count as
+                                 // red, so it measured ~20x52 (0.38) and was rejected
 
 typedef struct
 {
@@ -265,15 +294,69 @@ char find_colour(uint8_t r, uint8_t g, uint8_t b)
         return 'B';
     } else if (90 <= c_hsv.H && c_hsv.H <= 150) {   // <-- was `90 <= H <= 150`
         return 'G';
-    } else if ((c_hsv.H <= 30 || c_hsv.H >= 330) && c_hsv.S >= 0.3) {
-    return 'R';
-}
+    } else if ((c_hsv.H <= RED_HUE_LOW_MAX || c_hsv.H >= RED_HUE_HIGH_MIN) &&
+               c_hsv.S >= RED_MIN_SAT && c_hsv.V >= RED_MIN_VAL) {
+        // FIX 2: was hue <= 30 / >= 330 with S >= 0.35, which let orange and warm light through
+        return 'R';
+    }
     return '0';
 }
 
 blob_t current_obj;
 
-static blob_t colour_detect(dl_matrix3du_t *img_m)
+// FIX 3: true if a red blob looks like a sign: solid and roughly square.
+// b->sizePX must still be the SAMPLED pixel count (before the * I_RES * I_RES).
+static bool red_blob_ok(const blob_t *b, int width, int height)
+{
+    int w = b->x_max - b->x_min + I_RES;   // box size in full-frame pixels
+    int h = b->y_max - b->y_min + I_RES;
+    float fill = (float)(b->sizePX * I_RES * I_RES) / (float)(w * h);
+    float aspect = (float)w / (float)h;
+
+    // A sign right in front of the camera gets cut off by the frame edge, which
+    // changes its shape, so only check the shape when the whole blob is in view.
+    bool touches_edge = b->x_min < I_RES || b->y_min < I_RES ||
+                        b->x_max >= width - I_RES || b->y_max >= height - I_RES;
+
+    bool fill_ok   = fill >= RED_MIN_FILL;
+    bool aspect_ok = touches_edge || (aspect >= RED_MIN_ASPECT && aspect <= RED_MAX_ASPECT);
+
+#if !LOG_CSV
+    // Shows WHY a red blob passed or failed, so the limits can be set from real numbers
+    Serial.printf("  red blob %dx%d fill=%.2f%s aspect=%.2f%s%s\n", w, h,
+                  fill, fill_ok ? "" : "(LOW)",
+                  aspect, aspect_ok ? "" : "(BAD)",
+                  touches_edge ? " edge" : "");
+#endif
+    return fill_ok && aspect_ok;
+}
+
+#if HSV_PROBE
+static void hsv_probe(dl_matrix3du_t *img_m, bool draw)
+{
+    static unsigned long last = 0;
+    int cx = img_m->w / 2, cy = img_m->h / 2;
+    uint8_t *p = img_m->item + (cy * img_m->w + cx) * 3;   // BGR order
+    if (millis() - last > 1000) {
+        last = millis();
+        hsv_t c = rgb_to_hsv(p[2], p[1], p[0]);
+        Serial.printf("[HSV centre] H=%.0f S=%.2f V=%.2f  -> '%c'\n", c.H, c.S, c.V,
+                      find_colour(p[2], p[1], p[0]));
+    }
+    if (draw) {   // white cross so you can see where the probe is on /stream
+        fb_data_t fb;
+        fb.width = img_m->w; fb.height = img_m->h; fb.data = img_m->item;
+        fb.bytes_per_pixel = 3; fb.format = FB_BGR888;
+        fb_gfx_drawFastHLine(&fb, cx - 4, cy, 9, FACE_COLOR_WHITE);
+        fb_gfx_drawFastVLine(&fb, cx, cy - 4, 9, FACE_COLOR_WHITE);
+    }
+}
+#endif
+
+// draw = true draws boxes/centroids into the image (for /stream).
+// FIX 1: the detection task passes false, so the stop sign model gets a clean image
+// (before, the model was shown the sign with rectangles and a crosshair drawn over it).
+static blob_t colour_detect(dl_matrix3du_t *img_m, bool draw)
 {
     int blob_count = 0;
 
@@ -340,31 +423,48 @@ static blob_t colour_detect(dl_matrix3du_t *img_m)
     peek_stop_sign_result(&ss);
 
 
-    //largest blob finder -> record the largest blob
-    blob_t largest;
-    fresh_blob(&largest, '?');
+    // FIX 3: pick the largest red blob that passes the shape filter. Only if there is
+    // none, fall back to the largest green/blue blob. (Before, the largest blob of ANY
+    // colour won, so a big green/blue blob could hide a stop sign from the UNO, and
+    // sparse red noise counted as a sign.)
+    blob_t pick_red, pick_other;
+    fresh_blob(&pick_red, '?');
+    fresh_blob(&pick_other, '?');
 
     for (uint16_t i = 0; i < blob_count; i++) {
         if (blob[i].sizePX < 30) continue;
 
         blob[i].x_cent = blob[i].sum_x / blob[i].sizePX;
         blob[i].y_cent = blob[i].sum_y / blob[i].sizePX;
+
+        bool rejected = (blob[i].colour == 'R') && !red_blob_ok(&blob[i], width, height);
+
         blob[i].sizePX = blob[i].sizePX * I_RES * I_RES;
 
-        if (largest.sizePX < blob[i].sizePX) {
-            largest = blob[i];
+        if (!rejected) {
+            blob_t *best = (blob[i].colour == 'R') ? &pick_red : &pick_other;
+            if (best->sizePX < blob[i].sizePX)
+                *best = blob[i];
         }
 
 #if !LOG_CSV
-        Serial.printf("centroid of %d pixel %c object exists at (%d, %d)\n",
-                      blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent);
+        Serial.printf("centroid of %d pixel %c object exists at (%d, %d)%s\n",
+                      blob[i].sizePX, blob[i].colour, blob[i].x_cent, blob[i].y_cent,
+                      rejected ? "  [rejected: not sign-shaped]" : "");
 #endif
 
-        draw_box(img_m, blob[i], blob[i].colour);
-        draw_centroid(img_m, blob[i].x_cent, blob[i].y_cent);
+        if (draw) {
+            // rejected red blobs are drawn purple so you can see them on /stream
+            draw_box(img_m, blob[i], rejected ? 'X' : blob[i].colour);
+            draw_centroid(img_m, blob[i].x_cent, blob[i].y_cent);
+        }
     }
 
-    return largest;
+#if HSV_PROBE
+    hsv_probe(img_m, draw);
+#endif
+
+    return (pick_red.sizePX > 0) ? pick_red : pick_other;
 }
 
 static uint8_t log_csv_row(void)
@@ -401,12 +501,20 @@ static void object_detect_task(void *arg)
         ok = false;
         stopsign_possible = false;
         if (xSemaphoreTake(camera_mutex, portMAX_DELAY) == pdTRUE) {
+            // FIX (latency): with fb_count = 2 the camera keeps a frame waiting in its
+            // buffer, so the first frame we get can be ~0.5 s old. Throw it away and
+            // take the next one, so we react to where the sign is NOW.
             camera_fb_t *fb = esp_camera_fb_get();
+            if (fb) {
+                esp_camera_fb_return(fb);
+                fb = esp_camera_fb_get();
+            }
             if (fb) {
                 dl_matrix3du_t *im = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
                 if (im) {
                     if (fmt2rgb888(fb->buf, fb->len, fb->format, im->item)) {
-                        blob_t the_strongest = colour_detect(im);
+                        // FIX 1: draw = false, so im->item stays clean for classify_rgb888() below
+                        blob_t the_strongest = colour_detect(im, false);
                         bool has_blob = (the_strongest.sizePX > 0);
                         int dist2obj = has_blob ? dist_class(the_strongest.sizePX) : -1;
 
@@ -445,7 +553,9 @@ static void object_detect_task(void *arg)
             }
             xSemaphoreGive(camera_mutex);
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+        // FIX (latency): was 500 ms between every frame. The model already takes ~1.2 s
+        // when it runs, so only a short pause is needed to let the web server have the camera.
+        vTaskDelay(pdMS_TO_TICKS(DETECT_DELAY_MS));
     }
 }
 
@@ -596,7 +706,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
             esp_camera_fb_return(fb);
             fb = NULL;
 
-            colour_detect(image_matrix);
+            colour_detect(image_matrix, true);   // /stream view: draw the boxes
 
             if (!fmt2jpg(image_matrix->item,
                          image_matrix->w * image_matrix->h * 3,

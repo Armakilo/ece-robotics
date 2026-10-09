@@ -142,10 +142,14 @@ object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
 #define STOP_SIGN_COOLDOWN_MS  5000  // ignore red/stop signs this long after the hold, so the car can drive past
 #define RED_FRESH_MS           2000  // red counts as "still there" if seen within this time
                                      // (the ESP32 sends about every 0.5-1.7 s, so keep this above ~1.7 s)
-#define RED_STOP_MIN_PX        150   // stop for red blobs at least this big (= close enough).
+#define RED_STOP_MIN_PX        100   // stop for red blobs at least this big (= close enough). Was 150.
                                      // KEEP THIS EQUAL TO STOP_CHECK_MIN_PX ON THE ESP32
 #define RED_REJECTS_TO_GO      2     // drive on after this many "not a stop sign" answers in a row
                                      // (1 = faster, but a stop sign missed once at a bad angle gets skipped)
+#define RED_HARD_STOP_PX       800   // FIX 4: a red blob this big is very close (~10 cm by the ESP32's
+                                     // dist_class table). It's treated as a stop sign even if the model
+                                     // said "not a stop sign", so RED_IGNORE can't drive into the sign.
+                                     // Raise it to stop closer, lower it to stop farther away.
 
 enum RedStopState
 {
@@ -195,6 +199,20 @@ static bool RedAhead(void)
          (millis() - obj_now.lastUpdate) < RED_FRESH_MS;
 }
 
+// FIX 4: true if a red object is so close the car must stop no matter what the model said
+static bool RedTooClose(void)
+{
+  return RedAhead() && obj_now.sizePX >= RED_HARD_STOP_PX;
+}
+
+static void RedStop_HardStop(void)
+{
+#if STOP_SIGN_DEBUG
+  Serial.print(F("{CLOSE RED - hard stop}"));
+#endif
+  RedStop_SetState(RS_SIGN_HOLD);
+}
+
 // Called by the message parser each time a camera message arrives
 static void StopSign_Check(void)
 {
@@ -218,6 +236,8 @@ static bool RedStop_MustStop(void)
       stop_sign_pending = false;
       RedStop_SetState(RS_SIGN_HOLD);
     }
+    else if (RedTooClose())
+      RedStop_HardStop();
     else if (RedAhead())
       RedStop_SetState(RS_RED_WAIT);
     break;
@@ -228,6 +248,8 @@ static bool RedStop_MustStop(void)
       stop_sign_pending = false;
       RedStop_SetState(RS_SIGN_HOLD); // confirmed: start the 3 s timer now
     }
+    else if (red_rejects >= RED_REJECTS_TO_GO && RedTooClose())
+      RedStop_HardStop(); // model says no, but it's right in front of us: stop anyway
     else if (red_rejects >= RED_REJECTS_TO_GO)
       RedStop_SetState(RS_RED_IGNORE); // background red, not a stop sign
     else if (!RedAhead())
@@ -240,6 +262,8 @@ static bool RedStop_MustStop(void)
       stop_sign_pending = false;
       RedStop_SetState(RS_SIGN_HOLD); // a real stop sign showed up
     }
+    else if (RedTooClose())
+      RedStop_HardStop(); // the ignored red got very close: it's probably the sign after all
     else if (!RedAhead())
       RedStop_SetState(RS_DRIVE); // that red is out of view, watch for new red again
     break;
@@ -381,7 +405,7 @@ static void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotio
   switch (Application_SmartRobotCarxxx0.Functional_Mode)
   {
   case Rocker_mode:
-    Kp = 10;
+    Kp = 5;
     UpperLimit = 255;
     break;
   case ObstacleAvoidance_mode:
