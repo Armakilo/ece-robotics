@@ -134,6 +134,10 @@ object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
     RED_WAIT   -> red no longer seen                           -> DRIVE
     RED_IGNORE -> drive, ignoring this red; a stop sign ('S')  -> SIGN_HOLD
     RED_IGNORE -> red no longer seen                           -> DRIVE
+    (stop sign confirmed: if it matches a sign in STOP_MAP the car first drives on to that
+     sign's stop line at the junction (TO_STOP_LINE), using the position estimate; otherwise
+     it holds right where it is)
+    TO_STOP_LINE -> estimate reaches the stop line             -> SIGN_HOLD
     SIGN_HOLD  -> 3 s passed                                   -> COOLDOWN
     COOLDOWN   -> drive, ignore red for 5 s so we can pass the sign -> DRIVE
 */
@@ -157,7 +161,8 @@ enum RedStopState
   RS_RED_WAIT,
   RS_RED_IGNORE,
   RS_SIGN_HOLD,
-  RS_COOLDOWN
+  RS_COOLDOWN,
+  RS_TO_STOP_LINE // stop sign confirmed and on the map: drive to its stop line, then hold
 };
 static RedStopState red_state = RS_DRIVE;
 
@@ -174,15 +179,16 @@ static unsigned long red_state_since = 0;
 static bool stop_sign_pending = false; // set when a "D1":"S" message arrives
 static uint8_t red_rejects = 0;        // "D1":"X" answers received while in RED_WAIT
 
-static void Camera_SignFix(void); // camera fusion, defined after the kinematic model
+static int8_t Camera_SignFix(void);                  // camera fusion, defined after the kinematic model
+static bool StopLine_Reached(int8_t m);             // true once the estimate is at map sign m's stop line
+#define TO_STOP_LINE_TIMEOUT_MS 6000                // hold anyway if the stop line isn't reached by then
+static int8_t approach_sign = -1;                   // STOP_MAP entry being approached
 
 static void RedStop_SetState(RedStopState s)
 {
   red_state = s;
   red_state_since = millis();
   red_rejects = 0;
-  if (s == RS_SIGN_HOLD)
-    Camera_SignFix(); // car is stopped at a stop sign: correct the position, log the sign
 #if STOP_SIGN_DEBUG
   switch (s)
   {
@@ -191,6 +197,7 @@ static void RedStop_SetState(RedStopState s)
   case RS_RED_IGNORE: Serial.print(F("{STATE RED_IGNORE - not a stop sign, driving on}")); break;
   case RS_SIGN_HOLD:  Serial.print(F("{STATE SIGN_HOLD - stop sign, 3s}")); break;
   case RS_COOLDOWN:   Serial.print(F("{STATE COOLDOWN - driving past}")); break;
+  case RS_TO_STOP_LINE: Serial.print(F("{STATE TO_STOP_LINE - driving to the junction}")); break;
   }
 #endif
 }
@@ -209,12 +216,23 @@ static bool RedTooClose(void)
   return RedAhead() && obj_now.sizePX >= RED_HARD_STOP_PX;
 }
 
+// A stop sign was confirmed: correct the position with the camera (Camera_SignFix), then either
+// drive on to the sign's stop line (sign on the map) or hold right here (unknown sign).
+static void RedStop_SignConfirmed(void)
+{
+  approach_sign = Camera_SignFix();
+  if (approach_sign >= 0 && !StopLine_Reached(approach_sign))
+    RedStop_SetState(RS_TO_STOP_LINE);
+  else
+    RedStop_SetState(RS_SIGN_HOLD);
+}
+
 static void RedStop_HardStop(void)
 {
 #if STOP_SIGN_DEBUG
   Serial.print(F("{CLOSE RED - hard stop}"));
 #endif
-  RedStop_SetState(RS_SIGN_HOLD);
+  RedStop_SignConfirmed();
 }
 
 // Called by the message parser each time a camera message arrives
@@ -238,7 +256,7 @@ static bool RedStop_MustStop(void)
     if (stop_sign_pending)
     {
       stop_sign_pending = false;
-      RedStop_SetState(RS_SIGN_HOLD);
+      RedStop_SignConfirmed();
     }
     else if (RedTooClose())
       RedStop_HardStop();
@@ -250,7 +268,7 @@ static bool RedStop_MustStop(void)
     if (stop_sign_pending)
     {
       stop_sign_pending = false;
-      RedStop_SetState(RS_SIGN_HOLD); // confirmed: start the 3 s timer now
+      RedStop_SignConfirmed(); // confirmed: go to the stop line / start the 3 s timer
     }
     else if (red_rejects >= RED_REJECTS_TO_GO && RedTooClose())
       RedStop_HardStop(); // model says no, but it's right in front of us: stop anyway
@@ -264,12 +282,18 @@ static bool RedStop_MustStop(void)
     if (stop_sign_pending)
     {
       stop_sign_pending = false;
-      RedStop_SetState(RS_SIGN_HOLD); // a real stop sign showed up
+      RedStop_SignConfirmed(); // a real stop sign showed up
     }
     else if (RedTooClose())
       RedStop_HardStop(); // the ignored red got very close: it's probably the sign after all
     else if (!RedAhead())
       RedStop_SetState(RS_DRIVE); // that red is out of view, watch for new red again
+    break;
+
+  case RS_TO_STOP_LINE:
+    stop_sign_pending = false; // it's the sign we're already handling
+    if (StopLine_Reached(approach_sign) || in_state >= TO_STOP_LINE_TIMEOUT_MS)
+      RedStop_SetState(RS_SIGN_HOLD);
     break;
 
   case RS_SIGN_HOLD:
@@ -685,17 +709,29 @@ static float Kinematics_PwmToWheel(int16_t pwm) // rad/s, signed
 }
 
 // Sets the inertial-frame origin to where the car is now (call at the start line / green light)
+/*---------------- Start pose ----------------
+  Where the car is when the E-stop is released (or Reset position is pressed), in the TRACK frame:
+  origin = bottom-right corner of the figure 8 (where the 1.25 m section meets the long diagonal),
+  X = up the long diagonal, Y = to the left of it, heading + = left. All the map data (corners,
+  stop sign, stop line) is in this frame, so if you are told to start somewhere else, only change
+  these three numbers. Default: at the origin, pointing up the diagonal.
+  Example: on the 1.2 m section, 0.3 m past the top-right corner, facing the crossing:
+    START_X_M 1.95, START_Y_M -0.78, START_PSI_DEG 120*/
+#define START_X_M     0.0f
+#define START_Y_M     0.0f
+#define START_PSI_DEG 0.0f
+
 void Kinematics_Reset(void)
 {
-  Pose_X = 0;
-  Pose_Y = 0;
-  Pose_Psi = 0;
-  Heading_Predicted = 0;
-  Est_X = 0;
-  Est_Y = 0;
-  Est_Psi = 0;
-  AppMPU6050getdata.agz = 0; // gyro heading starts at 0 together with the model
-  Heading_Gyro = 0;
+  Pose_X = START_X_M;
+  Pose_Y = START_Y_M;
+  Pose_Psi = START_PSI_DEG * (PI / 180.0f);
+  Heading_Predicted = START_PSI_DEG;
+  Est_X = START_X_M;
+  Est_Y = START_Y_M;
+  Est_Psi = START_PSI_DEG * (PI / 180.0f);
+  AppMPU6050getdata.agz = 0; // gyro heading starts at START_PSI_DEG together with the model
+  Heading_Gyro = START_PSI_DEG;
   lap_running = false; // lap timer starts when the car next moves
   Lap_Dist = 0;
   Lap_Count = 0;
@@ -749,7 +785,8 @@ void Kinematics_Update(void)
   {
     static float prev_d2 = 1e9f;
     Lap_Dist += fabs(v) * dt;
-    float d2 = Est_X * Est_X + Est_Y * Est_Y; // squared distance from the start point
+    float d2 = (Est_X - START_X_M) * (Est_X - START_X_M) +
+               (Est_Y - START_Y_M) * (Est_Y - START_Y_M); // squared distance from the start point
     // lap done at the closest approach to the start: inside the radius and moving away again
     if (Lap_Dist > LAP_MIN_M && d2 < LAP_RADIUS_M * LAP_RADIUS_M && d2 > prev_d2 + 1e-6f)
     {
@@ -790,25 +827,45 @@ void Kinematics_Update(void)
 #define CAM_GATE_DEG  45     // ... or with a heading more than this different
 #define CAM_HFOV_DEG  60.0f  // camera horizontal field of view (deg); adjust for a wide lens
 #define CAM_IMG_W     160    // QQVGA image width (pixels), D2 = blob centre x in this image
-#define CAM_RANGE_K   4.14f  // m*sqrt(px): range = K / sqrt(blob px). From the ESP32's
-                             // dist_class table: 275 px = 0.25 m -> K = 0.25 * sqrt(275)
+#define CAM_RANGE_K   18.0f  // m*sqrt(px): range = K / sqrt(blob px)  (pinhole: px ~ 1/range^2)
+                             // Was 4.14 from the ESP32's dist_class table (275 px = 0.25 m), which put
+                             // the real sign 0.21 m away when it was ~0.92 m away (16:4x run), so
+                             // K = 4.14 * 0.92 / 0.21 = 18. Measure once with a tape to refine.
 
 struct StopPoint
 {
-  float x, y;     // m, where the car stops for this sign (inertial frame, start = 0,0)
-  int16_t psi;    // deg, car heading there (wrapped to -180..180)
+  float x, y;           // m, where the camera confirms the sign (car stops in RED_WAIT here)
+  int16_t psi;          // deg, car heading there (wrapped to -180..180)
+  float line_x, line_y; // m, the stop line at the junction, where the car holds for 3 s
 };
-// EMPTY until real stop signs are on the track (the stops in the earlier logs were false
-// detections). To fill it in: place the signs, do one run, and copy each sign's
-// sign_stop_x_m / sign_stop_y_m and the heading there from the CSV (or measure where the car
-// stops with a tape), e.g.  {1.25f, 0.00f, 0},  then set STOP_MAP_N to the number of entries.
-// With STOP_MAP_N = 0 nothing is corrected; the stops and sign locations are still logged.
+// Real stop sign at the crossing (1.50, 0), facing the 1.2 m section of the long return leg.
+// Detection point from the 16:4x run: the camera confirmed it at (1.99, -0.80), heading 140 deg
+// (the previous run gave ~(1.94, -0.80)). Check it with a tape: car centre ~0.92 m before the
+// crossing, ~0.3 m past the top-right corner.
+// Stop line: STOP_LINE_GAP_M before the crossing along that leg (direction 120 deg):
+//   (1.50, 0) - 0.20 * (cos 120, sin 120) = (1.60, -0.17)
+#define STOP_LINE_GAP_M 0.20f // car centre this far before the crossing centre
 static const StopPoint STOP_MAP[] = {
-    {0.0f, 0.0f, 0}, // placeholder (ignored while STOP_MAP_N is 0)
+    {1.99f, -0.80f, 140, 1.50f + 0.5f * STOP_LINE_GAP_M, -0.866f * STOP_LINE_GAP_M},
 };
-#define STOP_MAP_N 0
+#define STOP_MAP_N (sizeof(STOP_MAP) / sizeof(STOP_MAP[0]))
 
-static void Camera_SignFix(void)
+// Distance still to drive to the stop line, measured along the approach direction
+// (detection point -> stop line). <= 0 once the estimate reaches or passes it.
+static bool StopLine_Reached(int8_t m)
+{
+  if (m < 0 || m >= (int8_t)STOP_MAP_N)
+    return true;
+  float ux = STOP_MAP[m].line_x - STOP_MAP[m].x;
+  float uy = STOP_MAP[m].line_y - STOP_MAP[m].y;
+  float len = hypot(ux, uy);
+  if (len < 0.01f)
+    return true;
+  float remaining = ((STOP_MAP[m].line_x - Est_X) * ux + (STOP_MAP[m].line_y - Est_Y) * uy) / len;
+  return remaining <= 0.02f;
+}
+
+static int8_t Camera_SignFix(void)
 {
   float x0 = Est_X, y0 = Est_Y; // estimate before the fix
   float dx = 0, dy = 0;
@@ -841,11 +898,11 @@ static void Camera_SignFix(void)
   }
 #endif
   // Where is the sign? Range and bearing from the latest red blob (default 0.4 m straight ahead)
-  float range = 0.4f, bearing = 0;
+  float range = 0.9f, bearing = 0;
   if (obj_now.colour == 'R' && obj_now.sizePX > 0)
   {
     range = CAM_RANGE_K / sqrt((float)obj_now.sizePX);
-    range = constrain(range, 0.1f, 1.5f);
+    range = constrain(range, 0.1f, 2.5f);
     // image x grows to the right, bearing is + to the left
     bearing = ((CAM_IMG_W / 2.0f) - obj_now.cent_x) * (CAM_HFOV_DEG * PI / 180.0f / CAM_IMG_W);
   }
@@ -867,6 +924,7 @@ static void Camera_SignFix(void)
   Serial.print(',');
   Serial.print(match);
   Serial.print('}');
+  return match;
 }
 
 /*Telemetry for the ESP32 data logger, 5x per second:
@@ -898,7 +956,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
     }
     else
       AppMPU6050getdata.MPU6050_dveGetEulerAngles(&heading_actual);
-    Heading_Gyro = GYRO_SIGN * heading_actual; // used by the fusion in Kinematics_Update
+    Heading_Gyro = START_PSI_DEG + GYRO_SIGN * heading_actual; // used by the fusion in Kinematics_Update
   }
   if (millis() - last_send < 200)
     return;
@@ -911,6 +969,8 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
     state = F("RED_WAIT");
   else if (red_state == RS_SIGN_HOLD)
     state = F("STOP_SIGN");
+  else if (red_state == RS_TO_STOP_LINE)
+    state = F("TO_STOP_LINE");
   else if (track_state == TS_LIFTED)
     state = F("LIFTED");
   else if (track_state == TS_SEARCH)
@@ -1127,12 +1187,77 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Rocker(void)
   }
 }
 
-/*Line tracking mode*/
+/*Line tracking mode
+  Line search (all three sensors off the line), steered by the gyro:
+    1. turn toward the side the line most likely went, up to SEARCH_FIRST_DEG
+    2. turn back the other way, up to SEARCH_BACK_DEG past the starting heading
+    3. turn back to the starting heading, then give up (LINE_LOST) and stop.
+  Which side first (Search_FirstSide):
+    a. near a corner of the track (fused position estimate within CORNER_NEAR_M): the direction
+       that corner turns. The estimate was within ~0.1 m of every corner in the 16:4x run.
+    b. otherwise the side sensor that saw the line in the last LAST_SIDE_FRESH_MS
+    c. otherwise right first, like the original Elegoo search.
+  History: the original search spun right 0.2 s then left, and every glimpse of the tape restarted
+  it, so at the 90 deg LEFT corner it kept spinning right (16:2x, 16:4x). v9's first fix used only
+  the last side sensor, which on the long diagonal was a stale LEFT correction (the car veers
+  right), so at the first (RIGHT) corner it searched left and turned all the way around.
+  A glimpse of the line shorter than GLIMPSE_MS no longer restarts the search, and the search
+  direction is fixed when the search starts.*/
+#define SEARCH_FIRST_DEG    140   // first sweep (corners are 30-137 deg; the line we came along is at 180)
+#define SEARCH_BACK_DEG     90    // second sweep, the other way
+#define SEARCH_TIMEOUT_MS   6000  // give up anyway after this long
+#define LAST_SIDE_FRESH_MS  300   // a side sensor reading older than this is stale
+#define GLIMPSE_MS          250   // line must be seen this long to end a search
+#define CORNER_NEAR_M       0.6f
+
+struct TrackCorner
+{
+  float x, y;
+  int8_t dir; // +1 = the track turns left here, -1 = right
+};
+// Corners of the figure 8 (track drawing, inertial frame, start = (0,0) facing up the diagonal)
+static const TrackCorner TRACK_CORNERS[] = {
+    {3.20f, 0.00f, -1},  // top left, 136.6 deg right
+    {2.10f, -1.04f, -1}, // top right, 103.4 deg right
+    {1.00f, 0.87f, 1},   // end of the 1 m section, 30 deg left
+    {0.63f, 1.08f, 1},   // 90 deg left
+    {0.00f, 0.00f, 1},   // back at the start, 120 deg left
+};
+#define TRACK_CORNERS_N (sizeof(TRACK_CORNERS) / sizeof(TRACK_CORNERS[0]))
+
+static int8_t line_last_side = -1;         // +1 = LEFT sensor saw the line last, -1 = RIGHT
+static unsigned long line_last_side_ms = 0; // when
+
+static int8_t Search_FirstSide(void)
+{
+  float best = CORNER_NEAR_M;
+  int8_t side = 0;
+  for (uint8_t i = 0; i < TRACK_CORNERS_N; i++)
+  {
+    float d = hypot(TRACK_CORNERS[i].x - Est_X, TRACK_CORNERS[i].y - Est_Y);
+    if (d < best)
+    {
+      best = d;
+      side = TRACK_CORNERS[i].dir;
+    }
+  }
+  if (side != 0)
+    return side;
+  if (millis() - line_last_side_ms < LAST_SIDE_FRESH_MS)
+    return line_last_side;
+  return -1;
+}
+
 void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
 {
   static boolean timestamp = true;
   static boolean BlindDetection = true;
   static unsigned long MotorRL_time = 0;
+  static float search_psi0 = 0;   // gyro heading when the line was lost
+  static uint8_t search_phase = 0;
+  static int8_t search_side = -1; // direction of the first sweep, fixed for the whole search
+  static bool on_line = false;
+  static unsigned long on_line_since = 0;
 
   // FIX: update the red / stop sign states every loop. They used to advance only when the car
   // tried to move, so if the line search gave up during a stop-sign hold, the hold never ended
@@ -1149,65 +1274,73 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
     }
     track_state = TS_FOLLOW; // changed below if the line is lost
 
-    // int getAnaloguexxx_L = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_L();
-    // int getAnaloguexxx_M = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_M();
-    // int getAnaloguexxx_R = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_R();
-#if _Test_print
-    static unsigned long print_time = 0;
-    if (millis() - print_time > 500)
+    bool seen_M = function_xxx(TrackingData_M, TrackingDetection_S, TrackingDetection_E);
+    bool seen_R = function_xxx(TrackingData_R, TrackingDetection_S, TrackingDetection_E);
+    bool seen_L = function_xxx(TrackingData_L, TrackingDetection_S, TrackingDetection_E);
+    if (seen_M || seen_R || seen_L)
     {
-      print_time = millis();
-      Serial.print("ITR20001_getAnaloguexxx_L=");
-      Serial.println(getAnaloguexxx_L);
-      Serial.print("ITR20001_getAnaloguexxx_M=");
-      Serial.println(getAnaloguexxx_M);
-      Serial.print("ITR20001_getAnaloguexxx_R=");
-      Serial.println(getAnaloguexxx_R);
-    }
-#endif
-    if (function_xxx(TrackingData_M, TrackingDetection_S, TrackingDetection_E))
-    {
-      /*Achieve straight and uniform speed movement*/
-      ApplicationFunctionSet_SmartRobotCarMotionControl(Forward, 100);
-      timestamp = true;
-      BlindDetection = true;
-    }
-    else if (function_xxx(TrackingData_R, TrackingDetection_S, TrackingDetection_E))
-    {
-      /*Turn right*/
-      ApplicationFunctionSet_SmartRobotCarMotionControl(Right, 100);
-      timestamp = true;
-      BlindDetection = true;
-    }
-    else if (function_xxx(TrackingData_L, TrackingDetection_S, TrackingDetection_E))
-    {
-      /*Turn left*/
-      ApplicationFunctionSet_SmartRobotCarMotionControl(Left, 100);
-      timestamp = true;
-      BlindDetection = true;
+      if (seen_M)
+        ApplicationFunctionSet_SmartRobotCarMotionControl(Forward, 100); /*straight*/
+      else if (seen_R)
+      {
+        ApplicationFunctionSet_SmartRobotCarMotionControl(Right, 100); /*Turn right*/
+        line_last_side = -1;
+        line_last_side_ms = millis();
+      }
+      else
+      {
+        ApplicationFunctionSet_SmartRobotCarMotionControl(Left, 100); /*Turn left*/
+        line_last_side = 1;
+        line_last_side_ms = millis();
+      }
+      if (!on_line)
+      {
+        on_line = true;
+        on_line_since = millis();
+      }
+      // Only a real find ends the search; a glimpse keeps the current search going
+      if (millis() - on_line_since >= GLIMPSE_MS || timestamp)
+      {
+        timestamp = true;
+        BlindDetection = true;
+      }
     }
     else ////The car is not on the black line. execute Blind scan
     {
+      on_line = false;
       track_state = BlindDetection ? TS_SEARCH : TS_LOST;
       if (timestamp == true) //acquire timestamp
       {
         timestamp = false;
         MotorRL_time = millis();
+        search_psi0 = Heading_Gyro;
+        search_phase = 0;
+        search_side = Search_FirstSide();
         ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
       }
-      /*Blind Detection*/
-      if ((function_xxx((millis() - MotorRL_time), 0, 200) || function_xxx((millis() - MotorRL_time), 1600, 2000)) && BlindDetection == true)
+      /*Blind Detection, steered by the gyro*/
+      if (BlindDetection == true)
       {
-        ApplicationFunctionSet_SmartRobotCarMotionControl(Right, 100);
-      }
-      else if (((function_xxx((millis() - MotorRL_time), 200, 1600))) && BlindDetection == true)
-      {
-        ApplicationFunctionSet_SmartRobotCarMotionControl(Left, 100);
-      }
-      else if ((function_xxx((millis() - MotorRL_time), 3000, 3500))) // Blind Detection ...s ?
-      {
-        BlindDetection = false;
-        ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
+        // degrees turned since the line was lost, + = toward the first-sweep side
+        float turned = (Heading_Gyro - search_psi0) * search_side;
+        if (search_phase == 0 && turned >= SEARCH_FIRST_DEG)
+          search_phase = 1; // not found on that side: sweep back to the other side
+        else if (search_phase == 1 && turned <= -SEARCH_BACK_DEG)
+          search_phase = 2; // not there either: return to the starting heading
+        else if (search_phase == 2 && turned >= 0)
+          search_phase = 3;
+        if (search_phase == 3 || millis() - MotorRL_time > SEARCH_TIMEOUT_MS)
+        {
+          BlindDetection = false; // give up: LINE_LOST, stopped
+          ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
+        }
+        else
+        {
+          // phases 0 and 2 turn toward the first-sweep side, phase 1 away from it
+          bool toward = (search_phase != 1);
+          bool left = toward == (search_side > 0);
+          ApplicationFunctionSet_SmartRobotCarMotionControl(left ? Left : Right, 100);
+        }
       }
     }
   }
