@@ -119,4 +119,11 @@ private:
 };
 extern ApplicationFunctionSet Application_FunctionSet;
 extern float Heading_Predicted; // degrees, from the kinematic model; logged by ApplicationFunctionSet_Telemetry
+
+// Kinematic model (dead reckoning). Pose in the inertial frame: metres, metres, radians.
+extern float Pose_X, Pose_Y, Pose_Psi;
+// Gyro-fused estimate (metres, metres, radians) and the gyro heading (degrees, + = left)
+extern float Est_X, Est_Y, Est_Psi, Heading_Gyro;
+void Kinematics_Update(void); // call every loop
+void Kinematics_Reset(void);  // set the origin to the car's current position (start line)
 #endif

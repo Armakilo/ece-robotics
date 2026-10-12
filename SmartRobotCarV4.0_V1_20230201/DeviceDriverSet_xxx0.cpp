@@ -204,11 +204,29 @@ void DeviceDriverSet_Motor::DeviceDriverSet_Motor_Test(void)
 /*
  Motor_control：AB / movement direction and speed
 */
+// Last PWM sent to each side, + = forward, - = backward. Read by the kinematic model
+// (Kinematics_Update in ApplicationFunctionSet_xxx0.cpp). A = RIGHT side, B = LEFT side.
+int16_t g_cmdR = 0;
+int16_t g_cmdL = 0;
+
 void DeviceDriverSet_Motor::DeviceDriverSet_Motor_control(boolean direction_A, uint8_t speed_A, //Group A motor parameters
                                                           boolean direction_B, uint8_t speed_B, //Group B motor parameters
                                                           boolean controlED                     //AB enable setting (true)
                                                           )                                     //Motor control
 {
+  // Record the command for the kinematic model. Note: direction_* is a boolean, so
+  // direction_void (3) arrives as "true"; every stop in this code also passes speed 0,
+  // so the recorded value is 0 in that case either way.
+  if (controlED == control_enable)
+  {
+    g_cmdR = direction_A ? (int16_t)speed_A : -(int16_t)speed_A;
+    g_cmdL = direction_B ? (int16_t)speed_B : -(int16_t)speed_B;
+  }
+  else
+  {
+    g_cmdR = 0;
+    g_cmdL = 0;
+  }
 
   if (controlED == control_enable) //Enable motot control？
   {

@@ -15,6 +15,7 @@ public:
   bool MPU6050_dveInit(void);
   bool MPU6050_calibration(void);
   bool MPU6050_dveGetEulerAngles(float *Yaw);
+  void MPU6050_dveStill(void); // car is known to be still: refine the offset, don't integrate
 
 public:
   //int16_t ax, ay, az, gx, gy, gz;
@@ -23,7 +24,7 @@ public:
   unsigned long now, lastTime = 0;
   float dt;      //Derivative time
   float agz = 0; //Angle variable
-  long gzo = 0;  //Gyro offset
+  float gzo = 0; //Gyro offset (raw counts)
 };
 
 extern MPU6050_getdata MPU6050Getdata;

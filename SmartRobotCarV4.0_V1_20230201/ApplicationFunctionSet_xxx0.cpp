@@ -18,7 +18,7 @@
 #include "ApplicationFunctionSet_xxx0.h"
 #include "DeviceDriverSet_xxx0.h"
 
-#include "ArduinoJson-v6.11.1.h" //ArduinoJson
+// ArduinoJson removed (hand parser in SerialPortDataAnalysis, saves flash)
 #include "MPU6050_getdata.h"
 
 #define _is_print 1
@@ -174,11 +174,15 @@ static unsigned long red_state_since = 0;
 static bool stop_sign_pending = false; // set when a "D1":"S" message arrives
 static uint8_t red_rejects = 0;        // "D1":"X" answers received while in RED_WAIT
 
+static void Camera_SignFix(void); // camera fusion, defined after the kinematic model
+
 static void RedStop_SetState(RedStopState s)
 {
   red_state = s;
   red_state_since = millis();
   red_rejects = 0;
+  if (s == RS_SIGN_HOLD)
+    Camera_SignFix(); // car is stopped at a stop sign: correct the position, log the sign
 #if STOP_SIGN_DEBUG
   switch (s)
   {
@@ -296,7 +300,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Init(void)
   AppServo.DeviceDriverSet_Servo_Init(90);
   AppKey.DeviceDriverSet_Key_Init();
   AppRBG_LED.DeviceDriverSet_RBGLED_Init(20);
-  AppIRrecv.DeviceDriverSet_IRrecv_Init();
+  // AppIRrecv.DeviceDriverSet_IRrecv_Init(); // IR remote not used (saves flash)
   AppULTRASONIC.DeviceDriverSet_ULTRASONIC_Init();
   AppITR20001.DeviceDriverSet_ITR20001_Init();
   res_error = AppMPU6050getdata.MPU6050_dveInit();
@@ -587,6 +591,8 @@ void ApplicationFunctionSet::ApplicationFunctionSet_ForceTrackingMode(void)
   {"N":300,"D1":1} (engage) or {"N":300,"D1":0} (release), see SerialPortDataAnalysis.
   Returns true while engaged so loop() can skip all driving code.*/
 static bool estop_active = false;
+#define RESET_ON_ESTOP_RELEASE 1 // 1 = releasing the E-stop zeroes the position and starts the lap timer
+                                 // (so an E-stop in the middle of a run restarts the coordinates there)
 bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
 {
   if (estop_active)
@@ -597,17 +603,303 @@ bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
   return estop_active;
 }
 
-float Heading_Predicted = NAN; // degrees, set this from the kinematic model (blank in the log until set)
+float Heading_Predicted = NAN; // degrees, set by Kinematics_Update()
+
+/*---------------- Kinematic model (dead reckoning from the motor commands) ----------------
+  Inertial frame: origin = where the pose was last reset (the start / traffic light),
+  X = the car's starting direction, Y = to its left, heading psi = 0 at reset, + = turning left.
+
+  Wheel speed from PWM (measured with Kinematics_Calibration.ino, PWM 100/130/160 straight runs
+  and a PWM 100 spin):   w_wheel = K_WHEEL * (|PWM| - PWM_DEAD)   for |PWM| >= PWM_STALL
+    v   = r (wR + wL) / 2          psi_dot = r (wR - wL) / L
+    X  += v cos(psi) dt            Y      += v sin(psi) dt          (midpoint psi)
+  The input is the same PWM that drives the wheels (g_cmdR / g_cmdL, recorded in
+  DeviceDriverSet_Motor_control).*/
+#define WHEEL_R_M  0.0325f  // wheel radius (m), 65 mm wheels
+#define PWM_STALL  35       // below this the wheels don't start turning
+#define PWM_DEAD   5.3f     // zero point of the speed line (3-point fit)
+#define MOTOR_TAU  0.15f    // wheel speed time constant (s): a wheel takes ~0.15 s to reach ~2/3 of
+                            // its new speed. Without this, the tracker's short steering pulses were
+                            // counted as full-speed turns. (The calibration distances were measured
+                            // to where the car STOPPED, so spin-up loss and coasting cancel and the
+                            // calibrated K_WHEEL is already the steady-state value.)
+// Wheel rad/s per PWM count above PWM_DEAD. Calibration floor (3-point fit, 100/130/160): 0.1267.
+// On the track the model came out ~5% long (legs 3.30/1.59/2.37 m vs 3.20/1.51/2.20 m) and turned
+// ~6% too much, so 0.1267 / 1.05 = 0.1207 (lowering K fixes both: turn rate scales with K / L).
+#define K_WHEEL    0.1207f
+// EFFECTIVE wheelbase (m) from the PWM 100 spin test (skid steer, so ~2x the real 14 cm width).
+// Checked on the track: model/gyro = 98% and 109% on the two corner turns.
+#define TRACK_L_M  0.289f
+// Left/right motor mismatch: at PWM 100 the car veers RIGHT at 2.4 deg/s (calibration straight
+// runs), i.e. the left side is faster by  e = w_veer * L / v = 0.0419 * 0.289 / 0.390 = 0.031.
+// Without this the model only saw the tracker's LEFT correction pulses and drifted left at
+// 2.4 deg/s on straight line (log: +27 deg predicted vs +1 deg gyro over 11 s).
+#define TRIM_LEFT_FASTER 0.031f
+
+// 1 if turning the car LEFT by hand makes the gyro heading go UP (calibration sketch 'g'),
+// -1 if it goes DOWN. Makes the logged gyro heading use the same sign as the model.
+#define GYRO_SIGN  -1   // set from the g test: turning left by hand made the raw heading go DOWN
+
+extern int16_t g_cmdR, g_cmdL; // DeviceDriverSet_xxx0.cpp
+
+float Pose_X = 0;   // m
+float Pose_Y = 0;   // m
+float Pose_Psi = 0; // rad
+
+/*---------------- Gyro fusion ----------------
+  Estimated pose = the kinematic model, but its heading is continuously pulled toward the gyro
+  heading (complementary filter):
+      psi_est += w_model * dt                               (predict with the model)
+      psi_est += dt / (FUSION_T + dt) * (psi_gyro - psi_est) (correct with the gyro)
+  and the estimated X/Y are integrated with psi_est. The model alone over-counts the tracker's
+  short steering pulses (~+2 deg/s false left drift on straight line); the gyro was within ~3 deg
+  of the real track on the corners, so it gets most of the weight (short FUSION_T).
+  Hand-check on the 14:52 run: corners came out within ~0.1 m of the track instead of 0.5-0.7 m.*/
+#define FUSION_T   0.5f     // s: how fast the estimate follows the gyro. Smaller = trust gyro more.
+
+float Heading_Gyro = 0; // deg, same sign convention as the model (+ = left), 0 at pose reset
+float Est_X = 0;        // m
+float Est_Y = 0;        // m
+float Est_Psi = 0;      // rad
+
+/*---------------- Lap time / distance ----------------
+  The lap timer starts the first time the motors turn after a pose reset (so press Reset position
+  with the car on the start line, then release the E-stop). A lap is complete when the car has
+  driven at least LAP_MIN_M and the fused estimate passes closest to the start point (within
+  LAP_RADIUS_M). Average speed = lap distance / lap time (stop-sign holds included).*/
+#define LAP_MIN_M     6.0f   // the figure 8 is 8.59 m, so this rejects false laps near the start
+#define LAP_RADIUS_M  0.4f   // how close to the start the estimate must come
+
+static bool lap_running = false;
+static unsigned long lap_start = 0; // millis() when the current lap started
+float Lap_Dist = 0;                 // m driven in the current lap (odometer, from the model)
+uint8_t Lap_Count = 0;              // laps completed since the pose reset
+
+static float Kinematics_PwmToWheel(int16_t pwm) // rad/s, signed
+{
+  int16_t a = abs(pwm);
+  if (a < PWM_STALL)
+    return 0;
+  float w = K_WHEEL * (a - PWM_DEAD);
+  return pwm < 0 ? -w : w;
+}
+
+// Sets the inertial-frame origin to where the car is now (call at the start line / green light)
+void Kinematics_Reset(void)
+{
+  Pose_X = 0;
+  Pose_Y = 0;
+  Pose_Psi = 0;
+  Heading_Predicted = 0;
+  Est_X = 0;
+  Est_Y = 0;
+  Est_Psi = 0;
+  AppMPU6050getdata.agz = 0; // gyro heading starts at 0 together with the model
+  Heading_Gyro = 0;
+  lap_running = false; // lap timer starts when the car next moves
+  Lap_Dist = 0;
+  Lap_Count = 0;
+}
+
+// Call every loop. Uses the PWM that was applied since the previous call.
+void Kinematics_Update(void)
+{
+  static unsigned long last = 0;
+  unsigned long now = micros();
+  if (last == 0)
+  {
+    last = now;
+    return;
+  }
+  float dt = (now - last) * 1e-6f;
+  last = now;
+  if (dt > 0.2f) // loop stalled (e.g. a servo delay): don't integrate a huge step
+    dt = 0.2f;
+
+  // Wheels can't change speed instantly: first-order lag toward the commanded speed
+  static float wR = 0, wL = 0;
+  float a = dt / (MOTOR_TAU + dt);
+  wR += a * (Kinematics_PwmToWheel(g_cmdR) * (1.0f - 0.5f * TRIM_LEFT_FASTER) - wR);
+  wL += a * (Kinematics_PwmToWheel(g_cmdL) * (1.0f + 0.5f * TRIM_LEFT_FASTER) - wL);
+  float v = WHEEL_R_M * (wR + wL) / 2.0f;
+  float w = WHEEL_R_M * (wR - wL) / TRACK_L_M;
+
+  float psi_mid = Pose_Psi + 0.5f * w * dt;
+  Pose_X += v * cos(psi_mid) * dt;
+  Pose_Y += v * sin(psi_mid) * dt;
+  Pose_Psi += w * dt;
+
+  // Fused estimate: same motion, heading corrected toward the gyro
+  float est_mid = Est_Psi + 0.5f * w * dt;
+  Est_X += v * cos(est_mid) * dt;
+  Est_Y += v * sin(est_mid) * dt;
+  Est_Psi += w * dt;
+  Est_Psi += (dt / (FUSION_T + dt)) * (Heading_Gyro * (PI / 180.0f) - Est_Psi);
+
+  Heading_Predicted = Pose_Psi * (180.0f / PI);
+
+  // Lap timing
+  if (!lap_running && (g_cmdR != 0 || g_cmdL != 0))
+  {
+    lap_running = true;
+    lap_start = millis();
+    Lap_Dist = 0;
+  }
+  if (lap_running)
+  {
+    static float prev_d2 = 1e9f;
+    Lap_Dist += fabs(v) * dt;
+    float d2 = Est_X * Est_X + Est_Y * Est_Y; // squared distance from the start point
+    // lap done at the closest approach to the start: inside the radius and moving away again
+    if (Lap_Dist > LAP_MIN_M && d2 < LAP_RADIUS_M * LAP_RADIUS_M && d2 > prev_d2 + 1e-6f)
+    {
+      unsigned long t = millis() - lap_start;
+      Lap_Count++;
+      // {LP,lap number,lap time ms,lap distance mm}
+      Serial.print(F("{LP,"));
+      Serial.print(Lap_Count);
+      Serial.print(',');
+      Serial.print(t);
+      Serial.print(',');
+      Serial.print((long)(Lap_Dist * 1000));
+      Serial.print('}');
+      lap_start = millis(); // next lap starts here
+      Lap_Dist = 0;
+      d2 = 1e9f;
+    }
+    prev_d2 = d2;
+  }
+}
+
+/*---------------- Camera fusion: stop signs as position landmarks ----------------
+  The car stops for a stop sign when the sign's red blob reaches a fixed size in the camera
+  image (RED_STOP_MIN_PX), so it always stops the same distance from the sign. Each sign
+  therefore marks a known stopping point on the track (STOP_MAP). When the car stops at a
+  confirmed stop sign:
+    1. find the map point closest to the fused estimate, with a similar heading (gate)
+    2. pull the estimate toward it:  est += CAM_GAIN * (map - est)
+       The gyro fixes heading but not distance; this fixes the distance (along-track) error.
+    3. estimate where the sign itself is: range from the blob size (pinhole camera: blob
+       pixels ~ 1/range^2) and bearing from the blob's x position in the image
+  and send {SG,stop_x,stop_y,sign_x,sign_y,fix_dx,fix_dy,match} (mm) to the logger.
+  stop_x/stop_y is the estimate BEFORE the fix: after a run, put the averages for each sign
+  into STOP_MAP (or measure the stopping points on the track with a tape).*/
+#define CAM_FUSION    1      // 0 = only log the signs, don't correct the position
+#define CAM_GAIN      0.7f   // 0..1: how much to trust the map point over the estimate
+#define CAM_GATE_M    0.5f   // ignore map points farther than this from the estimate
+#define CAM_GATE_DEG  45     // ... or with a heading more than this different
+#define CAM_HFOV_DEG  60.0f  // camera horizontal field of view (deg); adjust for a wide lens
+#define CAM_IMG_W     160    // QQVGA image width (pixels), D2 = blob centre x in this image
+#define CAM_RANGE_K   4.14f  // m*sqrt(px): range = K / sqrt(blob px). From the ESP32's
+                             // dist_class table: 275 px = 0.25 m -> K = 0.25 * sqrt(275)
+
+struct StopPoint
+{
+  float x, y;     // m, where the car stops for this sign (inertial frame, start = 0,0)
+  int16_t psi;    // deg, car heading there (wrapped to -180..180)
+};
+// EMPTY until real stop signs are on the track (the stops in the earlier logs were false
+// detections). To fill it in: place the signs, do one run, and copy each sign's
+// sign_stop_x_m / sign_stop_y_m and the heading there from the CSV (or measure where the car
+// stops with a tape), e.g.  {1.25f, 0.00f, 0},  then set STOP_MAP_N to the number of entries.
+// With STOP_MAP_N = 0 nothing is corrected; the stops and sign locations are still logged.
+static const StopPoint STOP_MAP[] = {
+    {0.0f, 0.0f, 0}, // placeholder (ignored while STOP_MAP_N is 0)
+};
+#define STOP_MAP_N 0
+
+static void Camera_SignFix(void)
+{
+  float x0 = Est_X, y0 = Est_Y; // estimate before the fix
+  float dx = 0, dy = 0;
+  int8_t match = -1;
+#if CAM_FUSION
+  float psi_deg = Est_Psi * (180.0f / PI);
+  float best = CAM_GATE_M;
+  for (uint8_t i = 0; i < STOP_MAP_N; i++)
+  {
+    float dpsi = psi_deg - STOP_MAP[i].psi;
+    while (dpsi > 180)
+      dpsi -= 360;
+    while (dpsi < -180)
+      dpsi += 360;
+    if (fabs(dpsi) > CAM_GATE_DEG)
+      continue;
+    float d = hypot(STOP_MAP[i].x - x0, STOP_MAP[i].y - y0);
+    if (d < best)
+    {
+      best = d;
+      match = i;
+    }
+  }
+  if (match >= 0)
+  {
+    dx = CAM_GAIN * (STOP_MAP[match].x - x0);
+    dy = CAM_GAIN * (STOP_MAP[match].y - y0);
+    Est_X += dx;
+    Est_Y += dy;
+  }
+#endif
+  // Where is the sign? Range and bearing from the latest red blob (default 0.4 m straight ahead)
+  float range = 0.4f, bearing = 0;
+  if (obj_now.colour == 'R' && obj_now.sizePX > 0)
+  {
+    range = CAM_RANGE_K / sqrt((float)obj_now.sizePX);
+    range = constrain(range, 0.1f, 1.5f);
+    // image x grows to the right, bearing is + to the left
+    bearing = ((CAM_IMG_W / 2.0f) - obj_now.cent_x) * (CAM_HFOV_DEG * PI / 180.0f / CAM_IMG_W);
+  }
+  float sx = Est_X + range * cos(Est_Psi + bearing);
+  float sy = Est_Y + range * sin(Est_Psi + bearing);
+
+  Serial.print(F("{SG,"));
+  Serial.print((long)(x0 * 1000));
+  Serial.print(',');
+  Serial.print((long)(y0 * 1000));
+  Serial.print(',');
+  Serial.print((long)(sx * 1000));
+  Serial.print(',');
+  Serial.print((long)(sy * 1000));
+  Serial.print(',');
+  Serial.print((long)(dx * 1000));
+  Serial.print(',');
+  Serial.print((long)(dy * 1000));
+  Serial.print(',');
+  Serial.print(match);
+  Serial.print('}');
+}
 
 /*Telemetry for the ESP32 data logger, 5x per second:
-    {T,time_ms,heading_actual,heading_predicted,state}
-  Headings are sent in tenths of a degree (the ESP32 converts back) to avoid the float print code.
-  heading_actual is the integrated gyro yaw (0 at power-on).*/
+    {T,time_ms,heading_gyro,heading_pred,x_pred,y_pred,heading_est,x_est,y_est,lap_ds,lap_cm,laps,state}
+  lap_ds: current lap time in tenths of a second, lap_cm: current lap distance in cm,
+  laps: laps completed. Events: {SG,...} stop sign (Camera_SignFix), {LP,...} lap done.
+  Headings in tenths of a degree, positions in millimetres (integers, to avoid the float print code).
+  heading_gyro: integrated gyro yaw (0 at pose reset).  *_pred: kinematic model only.
+  *_est: model fused with the gyro heading.*/
 void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
 {
   static unsigned long last_send = 0;
   static float heading_actual = 0;
-  AppMPU6050getdata.MPU6050_dveGetEulerAngles(&heading_actual); // integrate the gyro every loop, not just when sending
+  // Integrate the gyro on a fixed 10 ms step instead of every loop (fewer I2C reads, steadier dt).
+  // While the motors have been off for 0.4 s the car is still, so instead of integrating, the gyro
+  // offset is re-measured (zero-velocity update). The power-on offset was off by ~8 deg/s, which
+  // the old dead-zone hid by throwing away all slow turning.
+  static unsigned long last_gyro = 0;
+  static unsigned long last_moving = 0;
+  if (g_cmdR != 0 || g_cmdL != 0)
+    last_moving = millis();
+  if (millis() - last_gyro >= 10)
+  {
+    last_gyro = millis();
+    if (millis() - last_moving > 400)
+    {
+      AppMPU6050getdata.MPU6050_dveStill();
+      heading_actual = AppMPU6050getdata.agz; // FIX: also refresh while still (e.g. right after a reset)
+    }
+    else
+      AppMPU6050getdata.MPU6050_dveGetEulerAngles(&heading_actual);
+    Heading_Gyro = GYRO_SIGN * heading_actual; // used by the fusion in Kinematics_Update
+  }
   if (millis() - last_send < 200)
     return;
   last_send = millis();
@@ -635,10 +927,26 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
   Serial.print(F("{T,"));
   Serial.print(last_send);
   Serial.print(',');
-  Serial.print((long)(heading_actual * 10));
+  Serial.print((long)(Heading_Gyro * 10));
   Serial.print(',');
   if (!isnan(Heading_Predicted))
     Serial.print((long)(Heading_Predicted * 10));
+  Serial.print(',');
+  Serial.print((long)(Pose_X * 1000));
+  Serial.print(',');
+  Serial.print((long)(Pose_Y * 1000));
+  Serial.print(',');
+  Serial.print((long)(Est_Psi * (1800.0f / PI)));
+  Serial.print(',');
+  Serial.print((long)(Est_X * 1000));
+  Serial.print(',');
+  Serial.print((long)(Est_Y * 1000));
+  Serial.print(',');
+  Serial.print(lap_running ? (long)((millis() - lap_start) / 100) : 0L); // lap time, tenths of s
+  Serial.print(',');
+  Serial.print((long)(Lap_Dist * 100)); // lap distance, cm
+  Serial.print(',');
+  Serial.print(Lap_Count);
   Serial.print(',');
   Serial.print(state);
   Serial.print('}');
@@ -825,6 +1133,12 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   static boolean timestamp = true;
   static boolean BlindDetection = true;
   static unsigned long MotorRL_time = 0;
+
+  // FIX: update the red / stop sign states every loop. They used to advance only when the car
+  // tried to move, so if the line search gave up during a stop-sign hold, the hold never ended
+  // (the log showed STOP_SIGN forever while the car had really lost the line).
+  RedStop_MustStop();
+
   if (Application_SmartRobotCarxxx0.Functional_Mode == TraceBased_mode)
   {
     if (Car_LeaveTheGround == false) //Check if the car leaves the ground
@@ -2036,316 +2350,99 @@ void ApplicationFunctionSet::ApplicationFunctionSet_IRrecv(void)
     }
   }
 }
-/*Data analysis on serial port*/
+/*Data analysis on serial port
+  The ESP32 only ever sends three commands the car uses (all flat JSON):
+    {"N":200,"D1":"S","D2":cx,"D3":cy,"D4":w,"D5":h,"D6":"R","D7":px,"D8":cm}  camera object
+    {"N":300,"D1":1}  E-stop engage (D1 0 = release)
+    {"N":301}         reset position
+  The Elegoo phone-app commands (N 1..110) were removed: the car is forced into
+  line-tracking mode every loop, so they could never take effect. Parsing these
+  three by hand instead of with ArduinoJson + String saves about 8 KB of flash.*/
+// Number after "key": (e.g. key "\"D2\":"), or def if the key isn't there
+static long Json_Long(const char *buf, const char *key, long def)
+{
+  const char *p = strstr(buf, key);
+  return p ? atol(p + strlen(key)) : def;
+}
+// First letter of the string value after "key":" (e.g. key "\"D1\":\""), or def
+static char Json_Char(const char *buf, const char *key, char def)
+{
+  const char *p = strstr(buf, key);
+  return p ? p[strlen(key)] : def;
+}
 void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
 {
-  static String SerialPortData = "";
-  uint8_t c = "";
-  if (Serial.available() > 0)
+  static char buf[96];
+  static uint8_t len = 0;
+  bool frame = false;
+  while (Serial.available() > 0)
   {
-    while (c != '}' && Serial.available() > 0)
+    char c = Serial.read();
+    if (c == '{')
+      len = 0; // start of a new frame (also drops any half-received junk)
+    if (len < sizeof(buf) - 1)
+      buf[len++] = c;
+    if (c == '}')
     {
-      // while (Serial.available() == 0)//Forcibly wait for a frame of data to be received
-      //   ;
-      c = Serial.read();
-      SerialPortData += (char)c;
+      frame = true;
+      break;
     }
   }
-  if (c == '}') //Data frame tail check
+  if (!frame)
+    return;
+  buf[len] = 0;
+  len = 0;
+
+  long n = Json_Long(buf, "\"N\":", -1);
+
+  if (n == 300) /* E-stop from the web page: D1 1 = engage, 0 = release */
   {
-#if _Test_print
-    Serial.println(SerialPortData);
+    bool was_active = estop_active;
+    estop_active = Json_Long(buf, "\"D1\":", 0) != 0;
+    Serial.println(estop_active ? F("{E-STOP ENGAGED}") : F("{E-STOP RELEASED}"));
+#if RESET_ON_ESTOP_RELEASE
+    // Releasing the E-stop starts a run: put the origin (X = Y = heading = 0) and the lap timer
+    // here, so the logged path always starts at the start line. (Pressing Reset position by hand
+    // after the car had started moving put the origin 0.45-0.58 m up the track in two runs.)
+    // The gyro offset was re-measured while the car stood still, so the heading starts clean.
+    if (was_active && !estop_active)
+    {
+      Kinematics_Reset();
+      Serial.print(F("{POSE RESET}"));
+    }
 #endif
-    // if (true == SerialPortData.equals("{f}") || true == SerialPortData.equals("{b}") || true == SerialPortData.equals("{l}") || true == SerialPortData.equals("{r}"))
-    // {
-    //   Serial.print(SerialPortData);
-    //   SerialPortData = "";
-    //   return;
-    // }
-    // ESP32 status messages that aren't JSON commands - ignore them
-    if (SerialPortData.equals("{Factory}") || SerialPortData.equals("{WA_NO}") ||
-        SerialPortData.equals("{WA_OK}"))
-    {
-      SerialPortData = "";
-      return;
-    }
-    StaticJsonDocument<200> doc;                                       //Declare a JsonDocument object
-    DeserializationError error = deserializeJson(doc, SerialPortData); //Deserialize JSON data from the serial data buffer
-    SerialPortData = "";
-    if (error)
-    {
-      Serial.println("error:deserializeJson");
-    }
-    else if (!error) //Check if the deserialization is successful
-    {
-      int control_mode_N = doc["N"];
-
-      if (control_mode_N == 300) /* E-stop from the web page: D1 1 = engage, 0 = release */
-      {
-        estop_active = doc["D1"];
-        Serial.println(estop_active ? F("{E-STOP ENGAGED}") : F("{E-STOP RELEASED}"));
-        return; // don't touch CommandSerialNumber
-      }
-
-      if (control_mode_N == 200) /* object sign data from ESP32 camera */
-      {
-        obj_prev = obj_now;
-
-        // FIX: D1 and D6 arrive as one-letter strings ("S", "R"). Assigning
-        // doc["D1"] straight to a char gives 0, so read the first letter of the string.
-        // FIX: keys now match what the ESP32 sends: D6 colour, D7 size, D8 distance
-        // (before, the UNO read D7/D8/D9, which were all off by one).
-        const char *type_str = doc["D1"];
-        const char *colour_str = doc["D6"];
-        obj_now.type = type_str ? type_str[0] : 'N';
-        obj_now.cent_x = doc["D2"];
-        obj_now.cent_y = doc["D3"];
-        obj_now.width = doc["D4"];
-        obj_now.height = doc["D5"];
-        obj_now.colour = colour_str ? colour_str[0] : '?';
-        obj_now.sizePX = doc["D7"];
-        obj_now.dist_cm = doc["D8"];
-        obj_now.lastUpdate = millis();
-
-
-
-        
+  }
+  else if (n == 301) /* "Reset position" button on the web page: car is at the origin now */
+  {
+    Kinematics_Reset();
+    Serial.print(F("{POSE RESET}"));
+  }
+  else if (n == 200) /* object sign data from ESP32 camera */
+  {
+    obj_prev = obj_now;
+    obj_now.type = Json_Char(buf, "\"D1\":\"", 'N');
+    obj_now.cent_x = Json_Long(buf, "\"D2\":", 0);
+    obj_now.cent_y = Json_Long(buf, "\"D3\":", 0);
+    obj_now.width = Json_Long(buf, "\"D4\":", 0);
+    obj_now.height = Json_Long(buf, "\"D5\":", 0);
+    obj_now.colour = Json_Char(buf, "\"D6\":\"", '?');
+    obj_now.sizePX = Json_Long(buf, "\"D7\":", 0);
+    obj_now.dist_cm = Json_Long(buf, "\"D8\":", -1);
+    obj_now.lastUpdate = millis();
 
 #if STOP_SIGN_DEBUG
-        // Echo every camera message the UNO understood, so you can check the link
-        Serial.print(F("{UNO rx type="));
-        Serial.print(obj_now.type);
-        Serial.print(F(" col="));
-        Serial.print(obj_now.colour);
-        Serial.print(F(" x="));
-        Serial.print(obj_now.cent_x);
-        Serial.print(F(" d="));
-        Serial.print(obj_now.dist_cm);
-        Serial.print('}');
+    // Echo every camera message the UNO understood, so you can check the link
+    Serial.print(F("{UNO rx type="));
+    Serial.print(obj_now.type);
+    Serial.print(F(" col="));
+    Serial.print(obj_now.colour);
+    Serial.print(F(" x="));
+    Serial.print(obj_now.cent_x);
+    Serial.print(F(" d="));
+    Serial.print(obj_now.dist_cm);
+    Serial.print('}');
 #endif
-        StopSign_Check();
-        return; // don't touch CommandSerialNumber
-      }
-
-      char *temp = doc["H"];
-      CommandSerialNumber = temp; //Get the serial number of the new command
-
-      /*Please view the following code blocks in conjunction with the Communication protocol for Smart Robot Car.pdf*/
-      switch (control_mode_N)
-      {
-      case 1: /*<Command：N 1> motor control mode */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_MotorControl;
-        CMD_is_MotorSelection = doc["D1"];
-        CMD_is_MotorSpeed = doc["D2"];
-        CMD_is_MotorDirection = doc["D3"];
-
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 2:                                                                     /*<Command：N 2> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_CarControl_TimeLimit; /*Car movement direction and speed control：Time limited mode*/
-        CMD_is_CarDirection = doc["D1"];
-        CMD_is_CarSpeed = doc["D2"];
-        CMD_is_CarTimer = doc["T"];
-        Application_SmartRobotCarxxx0.CMD_CarControl_Millis = millis();
-#if _is_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 3:                                                                       /*<Command：N 3> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_CarControl_NoTimeLimit; /*Car movement direction and speed control：No time limited mode*/
-        CMD_is_CarDirection = doc["D1"];
-        CMD_is_CarSpeed = doc["D2"];
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 4:                                                                   /*<Command：N 4> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_MotorControl_Speed; /*motor control:Control motor speed mode*/
-        CMD_is_MotorSpeed_L = doc["D1"];
-        CMD_is_MotorSpeed_R = doc["D2"];
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-      case 5:                                                             /*<Command：N 5> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_ServoControl; /*servo motor control*/
-        CMD_is_Servo = doc["D1"];
-        CMD_is_Servo_angle = doc["D2"];
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-      case 7:                                                                          /*<Command：N 7> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_LightingControl_TimeLimit; /*Lighting control:Time limited mode*/
-
-        CMD_is_LightingSequence = doc["D1"]; //Lighting (Left, front, right, back and center)
-        CMD_is_LightingColorValue_R = doc["D2"];
-        CMD_is_LightingColorValue_G = doc["D3"];
-        CMD_is_LightingColorValue_B = doc["D4"];
-        CMD_is_LightingTimer = doc["T"];
-        Application_SmartRobotCarxxx0.CMD_LightingControl_Millis = millis();
-#if _is_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 8:                                                                            /*<Command：N 8> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_LightingControl_NoTimeLimit; /*Lighting control:No time limited mode*/
-
-        CMD_is_LightingSequence = doc["D1"]; //Lighting (Left, front, right, back and center)
-        CMD_is_LightingColorValue_R = doc["D2"];
-        CMD_is_LightingColorValue_G = doc["D3"];
-        CMD_is_LightingColorValue_B = doc["D4"];
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 21: /*<Command：N 21>：ultrasonic sensor: detect obstacle distance */
-        CMD_UltrasoundModuleStatus_xxx0(doc["D1"]);
-#if _is_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 22: /*<Command：N 22>：IR sensor：for line tracking mode */
-        CMD_TraceModuleStatus_xxx0(doc["D1"]);
-#if _is_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 23: /*<Command：N 23>：Check if the car leaves the ground */
-        if (true == Car_LeaveTheGround)
-        {
-#if _is_print
-          Serial.print('{' + CommandSerialNumber + "_false}");
-#endif
-        }
-        else if (false == Car_LeaveTheGround)
-        {
-#if _is_print
-          Serial.print('{' + CommandSerialNumber + "_true}");
-#endif
-        }
-        break;
-
-      case 110:                                                                                 /*<Command：N 110> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_ClearAllFunctions_Programming_mode; /*Clear all function:Enter programming mode*/
-#if _is_print
-        Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-      case 100:                                                                             /*<Command：N 100> */
-        Application_SmartRobotCarxxx0.Functional_Mode = CMD_ClearAllFunctions_Standby_mode; /*Clear all function:Enter standby mode*/
-#if _is_print
-        Serial.print("{ok}");
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 101: /*<Command：N 101> :remote control to switch the car mode*/
-        if (1 == doc["D1"])
-        {
-          Application_SmartRobotCarxxx0.Functional_Mode = TraceBased_mode;
-        }
-        else if (2 == doc["D1"])
-        {
-          Application_SmartRobotCarxxx0.Functional_Mode = ObstacleAvoidance_mode;
-        }
-        else if (3 == doc["D1"])
-        {
-          Application_SmartRobotCarxxx0.Functional_Mode = Follow_mode;
-        }
-
-#if _is_print
-        Serial.print("{ok}");
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      case 105: /*<Command：N 105> :FastLED brightness adjustment control command*/
-        if (1 == doc["D1"] && (CMD_is_FastLED_setBrightness < 250))
-        {
-          CMD_is_FastLED_setBrightness += 5;
-        }
-        else if (2 == doc["D1"] && (CMD_is_FastLED_setBrightness > 0))
-        {
-          CMD_is_FastLED_setBrightness -= 5;
-        }
-        FastLED.setBrightness(CMD_is_FastLED_setBrightness);
-
-#if _Test_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-        Serial.print("{ok}");
-#endif
-        break;
-
-      case 106: /*<Command：N 106> */
-      {
-        uint8_t temp_Set_Servo = doc["D1"];
-        if (temp_Set_Servo > 5 || temp_Set_Servo < 1)
-          return;
-        ApplicationFunctionSet_Servo(temp_Set_Servo);
-      }
-
-#if _is_print
-        //Serial.print('{' + CommandSerialNumber + "_ok}");
-        Serial.print("{ok}");
-#endif
-        break;
-      case 102: /*<Command：N 102> :Rocker control mode command*/
-        Application_SmartRobotCarxxx0.Functional_Mode = Rocker_mode;
-        Rocker_temp = doc["D1"];
-        Rocker_CarSpeed = doc["D2"];
-        
-        switch (Rocker_temp)
-        {
-        case 1:
-          Application_SmartRobotCarxxx0.Motion_Control = Forward;
-          break;
-        case 2:
-          Application_SmartRobotCarxxx0.Motion_Control = Backward;
-          break;
-        case 3:
-          Application_SmartRobotCarxxx0.Motion_Control = Left;
-          break;
-        case 4:
-          Application_SmartRobotCarxxx0.Motion_Control = Right;
-          break;
-        case 5:
-          Application_SmartRobotCarxxx0.Motion_Control = LeftForward;
-          break;
-        case 6:
-          Application_SmartRobotCarxxx0.Motion_Control = LeftBackward;
-          break;
-        case 7:
-          Application_SmartRobotCarxxx0.Motion_Control = RightForward;
-          break;
-        case 8:
-          Application_SmartRobotCarxxx0.Motion_Control = RightBackward;
-          break;
-        case 9:
-          Application_SmartRobotCarxxx0.Motion_Control = stop_it;
-          Application_SmartRobotCarxxx0.Functional_Mode = Standby_mode;
-          break;
-        default:
-          Application_SmartRobotCarxxx0.Motion_Control = stop_it;
-          break;
-        }
-#if _is_print
-        // Serial.print('{' + CommandSerialNumber + "_ok}");
-#endif
-        break;
-
-      default:
-        break;
-      }
-    }
+    StopSign_Check();
   }
+  // anything else ({"N":100}, {Factory}, {WA_OK}, ...) is ignored
 }

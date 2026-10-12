@@ -26,6 +26,10 @@ void loop()
 
   Application_FunctionSet.ApplicationFunctionSet_SerialPortDataAnalysis();
 
+  // Kinematic model: integrate the pose from the PWM applied since the last loop.
+  // Before the E-stop check so time keeps running while stopped.
+  Kinematics_Update();
+
   // E-stop engaged (E-STOP button on the web page): skip tracking, red-stop logic and all motor commands
   bool estop = Application_FunctionSet.ApplicationFunctionSet_EStop();
 
@@ -49,12 +53,6 @@ void loop()
   // Application_FunctionSet.ApplicationFunctionSet_IRrecv();
 
 
-  Application_FunctionSet.CMD_ServoControl_xxx0();
-  Application_FunctionSet.CMD_MotorControl_xxx0();
-  Application_FunctionSet.CMD_CarControlTimeLimit_xxx0();
-  Application_FunctionSet.CMD_CarControlNoTimeLimit_xxx0();
-  Application_FunctionSet.CMD_MotorControlSpeed_xxx0();
-  Application_FunctionSet.CMD_LightingControlTimeLimit_xxx0();
-  Application_FunctionSet.CMD_LightingControlNoTimeLimit_xxx0();
-  Application_FunctionSet.CMD_ClearAllFunctions_xxx0();
+  // The Elegoo phone-app command handlers (CMD_..._xxx0) were removed from the loop:
+  // the car is always in line-tracking mode, so they never ran. Saves flash.
 }

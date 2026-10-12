@@ -944,7 +944,7 @@ void startCameraServer()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16; // default is 8, the data logger adds 4 more
+    config.max_uri_handlers = 16; // default is 8, the data logger adds 5 more
 
     httpd_uri_t index_uri = {
         .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL};
@@ -981,7 +981,7 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &Test_uri);
         httpd_register_uri_handler(camera_httpd, &Test1_uri);
         httpd_register_uri_handler(camera_httpd, &Test2_uri);
-        telemetry_register_handlers(camera_httpd); // /data, /log.csv, /log_clear, /estop
+        telemetry_register_handlers(camera_httpd); // /data, /log.csv, /log_clear, /estop, /pose_reset
     }
 
     config.server_port += 1;
