@@ -13,6 +13,7 @@
 
 
 
+
 /*Movement Direction Control List*/
 enum SmartRobotCarMotionControl
 {
@@ -145,5 +146,5 @@ extern float Pose_X, Pose_Y, Pose_Psi;
 extern float Est_X, Est_Y, Est_Psi, Heading_Gyro;
 void Kinematics_Update(void); // call every loop
 void Kinematics_Reset(void);  // set the origin to the car's current position (start line)
-static boolean function_xxx(long x, long s, long e); //f(x)
+boolean function_xxx(long x, long s, long e); //f(x)
 #endif

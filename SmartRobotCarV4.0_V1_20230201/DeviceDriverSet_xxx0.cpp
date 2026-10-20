@@ -6,6 +6,8 @@
  * @Description: Smart Robot Car V4.0
  * @FilePath: 
  */
+
+#include "movement.h"
 #include "DeviceDriverSet_xxx0.h"
 //#include "PinChangeInt.h"
 #include <avr/wdt.h>
@@ -301,7 +303,7 @@ void DeviceDriverSet_ULTRASONIC::DeviceDriverSet_ULTRASONIC_Get(uint16_t *ULTRAS
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  tempda_x = ((unsigned int)pulseIn(ECHO_PIN, HIGH) / 58);
+  tempda_x = ((unsigned int)pulseIn(ECHO_PIN, HIGH, 10000) / 58);
   // *ULTRASONIC_Get = tempda_x;
 
   if (tempda_x > 150)
@@ -401,7 +403,7 @@ void DeviceDriverSet_Servo::DeviceDriverSet_Servo_control(unsigned int Position_
 {
   myservo.attach(PIN_Servo_z);
   myservo.write(Position_angle);
-  delay_xxx(450);
+  delay_kinematics(450);
   myservo.detach();
 }
 //Servo motor control:Servo motor number and position angle

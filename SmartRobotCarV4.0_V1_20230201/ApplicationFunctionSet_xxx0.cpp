@@ -39,8 +39,7 @@ DeviceDriverSet_ULTRASONIC AppULTRASONIC;
 DeviceDriverSet_Servo AppServo;
 DeviceDriverSet_IRrecv AppIRrecv;
 /*f(x) int */
-static boolean
-function_xxx(long x, long s, long e) //f(x)
+boolean function_xxx(long x, long s, long e) //f(x)
 {
   if (s <= x && x <= e)
     return true;
@@ -1254,7 +1253,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   
   //Avoid obstacles
 
-  bug_pass(LHS);
+  bug_pass(RHS);
 
   RedStop_MustStop();
 
