@@ -69,9 +69,6 @@ for key, value in statedict.items():
         
 # when the state changes, it displays on the graph
 
-
-
-
 fig = pos_ax.figure
 divider = make_axes_locatable(pos_ax)
 cax1 = divider.append_axes("right", size="3%", pad=0.4)

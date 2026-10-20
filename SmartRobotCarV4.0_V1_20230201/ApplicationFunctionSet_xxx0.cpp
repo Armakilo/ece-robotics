@@ -56,19 +56,7 @@ delay_xxx(uint16_t _ms)
   }
 }
 
-/*Movement Direction Control List*/
-enum SmartRobotCarMotionControl
-{
-  Forward,       //(1)
-  Backward,      //(2)
-  Left,          //(3)
-  Right,         //(4)
-  LeftForward,   //(5)
-  LeftBackward,  //(6)
-  RightForward,  //(7)
-  RightBackward, //(8)
-  stop_it        //(9)
-};               //direction方向:（1）、（2）、 （3）、（4）、（5）、（6）
+
 
 /*Mode Control List*/
 enum SmartRobotCarFunctionalModel
@@ -313,7 +301,7 @@ static bool RedStop_MustStop(void)
 
 bool ApplicationFunctionSet_SmartRobotCarLeaveTheGround(void);
 void ApplicationFunctionSet_SmartRobotCarLinearMotionControl(SmartRobotCarMotionControl direction, uint8_t directionRecord, uint8_t speed, uint8_t Kp, uint8_t UpperLimit);
-void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed);
+
 
 void ApplicationFunctionSet::ApplicationFunctionSet_Init(void)
 {
@@ -416,7 +404,7 @@ static void ApplicationFunctionSet_SmartRobotCarLinearMotionControl(SmartRobotCa
   Input parameters:     1# direction:Forward（1）、Backward（2）、 Left（3）、Right（4）、LeftForward（5）、LeftBackward（6）、RightForward（7）RightBackward（8）
                         2# speed(0--255)
 */
-static void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed)
+void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed)
 {
   ApplicationFunctionSet Application_FunctionSet;
   static uint8_t directionRecord = 0;

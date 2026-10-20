@@ -11,6 +11,24 @@
 
 #include <Arduino.h>
 
+
+
+/*Movement Direction Control List*/
+enum SmartRobotCarMotionControl
+{
+  Forward,       //(1)
+  Backward,      //(2)
+  Left,          //(3)
+  Right,         //(4)
+  LeftForward,   //(5)
+  LeftBackward,  //(6)
+  RightForward,  //(7)
+  RightBackward, //(8)
+  stop_it        //(9)
+};               //direction方向:（1）、（2）、 （3）、（4）、（5）、（6）
+
+void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed);
+
 class ApplicationFunctionSet
 {
 public:
@@ -31,6 +49,7 @@ public:
   void ApplicationFunctionSet_ForceTrackingMode(void); // put the car in line-tracking mode
   bool ApplicationFunctionSet_EStop(void);             // web page emergency stop, true while engaged
   void ApplicationFunctionSet_Telemetry(bool estop_active); // send heading/state to the ESP32 logger
+  
 
 public: /*CMD*/
   void CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get);
@@ -126,4 +145,5 @@ extern float Pose_X, Pose_Y, Pose_Psi;
 extern float Est_X, Est_Y, Est_Psi, Heading_Gyro;
 void Kinematics_Update(void); // call every loop
 void Kinematics_Reset(void);  // set the origin to the car's current position (start line)
+static boolean function_xxx(long x, long s, long e); //f(x)
 #endif
