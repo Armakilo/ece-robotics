@@ -17,6 +17,7 @@
 #include <string.h>
 #include "ApplicationFunctionSet_xxx0.h"
 #include "DeviceDriverSet_xxx0.h"
+#include "movement.h"
 
 // ArduinoJson removed (hand parser in SerialPortDataAnalysis, saves flash)
 #include "MPU6050_getdata.h"
@@ -1250,6 +1251,11 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   // FIX: update the red / stop sign states every loop. They used to advance only when the car
   // tried to move, so if the line search gave up during a stop-sign hold, the hold never ended
   // (the log showed STOP_SIGN forever while the car had really lost the line).
+  
+  //Avoid obstacles
+
+  bug_pass(LHS);
+
   RedStop_MustStop();
 
   if (Application_SmartRobotCarxxx0.Functional_Mode == TraceBased_mode)

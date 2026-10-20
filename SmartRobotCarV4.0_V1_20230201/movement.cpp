@@ -6,13 +6,10 @@
 
 // bug algorithm
 
-typedef enum side{
-  LHS,
-  RHS
-}side;
 
 
-void bug_pass(int side){
+
+void bug_pass(uint8_t side){
   uint16_t distance = 150; //distance in CM
   uint16_t distance_thresh = 0;
 
@@ -64,6 +61,9 @@ void bug_pass(int side){
         SmartRobotCarMotionControl(Forward, 70);
         break;
 
+      }
+      else{
+        return;
       }
       case(2):
       Serial.println("right away!");
