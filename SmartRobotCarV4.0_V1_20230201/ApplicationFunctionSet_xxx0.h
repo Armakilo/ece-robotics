@@ -49,6 +49,7 @@ public:
   void ApplicationFunctionSet_IRrecv(void);
   void ApplicationFunctionSet_ForceTrackingMode(void); // put the car in line-tracking mode
   bool ApplicationFunctionSet_EStop(void);             // web page emergency stop, true while engaged
+  bool ApplicationFunctionSet_TrafficLight(void);      // start: wait for red then green, true while waiting
   void ApplicationFunctionSet_Telemetry(bool estop_active); // send heading/state to the ESP32 logger
   
 
@@ -139,6 +140,8 @@ private:
 };
 extern ApplicationFunctionSet Application_FunctionSet;
 extern float Heading_Predicted; // degrees, from the kinematic model; logged by ApplicationFunctionSet_Telemetry
+extern bool EStop_Pressed;      // set by every E-stop press; bug_pass() clears it when a pass starts and
+                                // cancels the pass if it gets set (even if a release is read straight after)
 
 // Kinematic model (dead reckoning). Pose in the inertial frame: metres, metres, radians.
 extern float Pose_X, Pose_Y, Pose_Psi;

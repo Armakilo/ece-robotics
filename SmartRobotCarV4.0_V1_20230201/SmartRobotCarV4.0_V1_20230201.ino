@@ -39,6 +39,10 @@ void loop()
   if (estop)
     return;
 
+  // Start of a run (power-on or E-stop released): stay stopped until the camera sees red, then green
+  if (Application_FunctionSet.ApplicationFunctionSet_TrafficLight())
+    return;
+
   // Keep the car in line-tracking mode (see the comment on this function in the .cpp)
   Application_FunctionSet.ApplicationFunctionSet_ForceTrackingMode();
 

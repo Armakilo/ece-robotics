@@ -232,6 +232,70 @@ static void StopSign_Check(void)
     red_rejects++;
 }
 
+/*---------------- Traffic light at the start (red foam = stop, green foam = go) ----------------
+  At power-on and every time the E-stop is released the car stays stopped:
+    LIGHT_LOOK -> red blob seen      -> LIGHT_RED (light identified, wait for green)
+    LIGHT_LOOK -> no red within 3 s  -> LIGHT_GO  (no red light there: drive)
+    LIGHT_RED  -> green blob seen    -> LIGHT_GO  (drive)
+  A green blob before any red is ignored: the light has to be identified first.
+*/
+#define LIGHT_MIN_PX 100     // blob size (px) for the red / green light to count (same as RED_STOP_MIN_PX)
+#define LIGHT_LOOK_MS 3000   // look for a red light this long before driving off without one
+enum LightState
+{
+  LIGHT_LOOK,
+  LIGHT_RED,
+  LIGHT_GO
+};
+static LightState light_state = LIGHT_LOOK;
+static unsigned long light_look_start = 0; // millis() when LIGHT_LOOK started
+static bool light_look_started = false;   // false = the 3 s haven't started yet
+static unsigned long light_red_time = 0;   // millis() when the red light was identified
+
+// True if a camera reading that arrived at or after 'since' saw a blob of this colour big (= close)
+// enough to be the light. Readings from before the check started (e.g. seen during the E-stop) don't count.
+static bool LightSeen(char colour, unsigned long since)
+{
+  return obj_now.colour == colour &&
+         obj_now.sizePX >= LIGHT_MIN_PX &&
+         (long)(obj_now.lastUpdate - since) >= 0 &&
+         (millis() - obj_now.lastUpdate) < RED_FRESH_MS;
+}
+
+// Returns true while the car must wait at the light
+bool ApplicationFunctionSet::ApplicationFunctionSet_TrafficLight(void)
+{
+  // Start the 3 s on the first check, not at power-on (setup itself takes a few seconds)
+  // (FIX: this used to store millis() | 1, which is 1 ms in the future on an even millisecond, so
+  //  millis() - light_look_start wrapped to ~4 billion and the 3 s check ended at once, ~half the time)
+  if (light_state == LIGHT_LOOK && !light_look_started)
+  {
+    light_look_start = millis();
+    light_look_started = true;
+  }
+  if (light_state == LIGHT_LOOK && LightSeen('R', light_look_start))
+  {
+    light_state = LIGHT_RED;
+    light_red_time = millis();
+    Serial.print(F("{LIGHT RED - waiting for green}"));
+  }
+  else if (light_state == LIGHT_LOOK && millis() - light_look_start >= LIGHT_LOOK_MS)
+  {
+    light_state = LIGHT_GO;
+    Serial.print(F("{LIGHT NONE - go}"));
+  }
+  else if (light_state == LIGHT_RED && LightSeen('G', light_red_time))
+  {
+    light_state = LIGHT_GO;
+    RedStop_SetState(RS_COOLDOWN); // don't stop for the red foam while pulling away
+    Serial.print(F("{LIGHT GREEN - go}"));
+  }
+  if (light_state == LIGHT_GO)
+    return false;
+  ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
+  return true;
+}
+
 // Called every time the car is about to move. Updates the state and
 // returns true if the car must stay stopped.
 static bool RedStop_MustStop(void)
@@ -603,6 +667,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_ForceTrackingMode(void)
   {"N":300,"D1":1} (engage) or {"N":300,"D1":0} (release), see SerialPortDataAnalysis.
   Returns true while engaged so loop() can skip all driving code.*/
 static bool estop_active = false;
+bool EStop_Pressed = false;      // see ApplicationFunctionSet_xxx0.h
 #define RESET_ON_ESTOP_RELEASE 1 // 1 = releasing the E-stop zeroes the position and starts the lap timer
                                  // (so an E-stop in the middle of a run restarts the coordinates there)
 bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
@@ -611,6 +676,10 @@ bool ApplicationFunctionSet::ApplicationFunctionSet_EStop(void)
   {
     // PWM 0 and STBY LOW: motor driver disabled
     AppMotor.DeviceDriverSet_Motor_control(direction_void, 0, direction_void, 0, control_enable);
+    // Re-arm the traffic light check every loop while stopped, so leaving the E-stop always starts
+    // with the 3 s CHECK_LIGHT, however the release arrives (the log showed releases that skipped it)
+    light_state = LIGHT_LOOK;
+    light_look_started = false;
   }
   return estop_active;
 }
@@ -953,6 +1022,12 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
   const __FlashStringHelper *state;
   if (estop_active)
     state = F("ESTOP");
+  else if (light_state == LIGHT_LOOK)
+    state = F("CHECK_LIGHT"); // first 3 s: checking for the red stop light
+  else if (light_state == LIGHT_RED)
+    state = F("RED_LIGHT");
+  else if (Overtaking)
+    state = F("OVERTAKING");
   else if (red_state == RS_RED_WAIT)
     state = F("RED_WAIT");
   else if (red_state == RS_SIGN_HOLD)
@@ -1254,6 +1329,8 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   //Avoid obstacles
 
   bug_pass(RHS);
+  if (estop_active || light_state != LIGHT_GO)
+    return; // E-stop pressed during the pass: don't drive until released and the light check has run
 
   RedStop_MustStop();
 
@@ -2526,6 +2603,17 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     bool was_active = estop_active;
     estop_active = Json_Long(buf, "\"D1\":", 0) != 0;
     Serial.println(estop_active ? F("{E-STOP ENGAGED}") : F("{E-STOP RELEASED}"));
+    if (estop_active)
+    {
+      EStop_Pressed = true;     // cancels a pass in progress, even if a release is read straight after
+      light_state = LIGHT_LOOK; // armed on the press too, so the next run always starts at the light
+      light_look_started = false;
+    }
+    if (was_active && !estop_active)
+    {
+      light_state = LIGHT_LOOK; // a new run starts at the traffic light
+      light_look_started = false; // 3 s look starts now
+    }
 #if RESET_ON_ESTOP_RELEASE
     // Releasing the E-stop starts a run: put the origin (X = Y = heading = 0) and the lap timer
     // here, so the logged path always starts at the start line. (Pressing Reset position by hand
