@@ -134,7 +134,8 @@ object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
 #define STOP_SIGN_COOLDOWN_MS  5000  // ignore red/stop signs this long after the hold, so the car can drive past
 #define RED_FRESH_MS           2000  // red counts as "still there" if seen within this time
                                      // (the ESP32 sends about every 0.5-1.7 s, so keep this above ~1.7 s)
-#define RED_STOP_MIN_PX        100   // stop for red blobs at least this big (= close enough). Was 150.
+#define RED_STOP_MIN_PX        60    // stop for red blobs at least this big (= close enough). Was 150, 100, then 70
+                                     // (a sign off to the side only reached 100 px nearly in front of the camera).
                                      // KEEP THIS EQUAL TO STOP_CHECK_MIN_PX ON THE ESP32
 #define RED_REJECTS_TO_GO      2     // drive on after this many "not a stop sign" answers in a row
                                      // (1 = faster, but a stop sign missed once at a bad angle gets skipped)
@@ -387,6 +388,10 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Init(void)
   //   /*Clear serial port buffer...*/
   // }
   Application_SmartRobotCarxxx0.Functional_Mode = Standby_mode;
+  // FIX: start the position estimate at the start pose at power-on too. Before, Pose/Est started
+  // at (0, 0) and only moved to START_X_M/START_Y_M when the E-stop was released, so a run started
+  // straight from power-on had the map offset by the start position (wrong corner turn directions).
+  Kinematics_Reset();
 }
 
 /*ITR20001 Check if the car leaves the ground*/
@@ -475,7 +480,9 @@ void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionContro
   uint8_t Kp, UpperLimit;
   uint8_t speed = is_speed;
 
-  if (direction != stop_it && RedStop_MustStop()) // red object / stop sign: override any movement
+  // red object / stop sign: override any movement (not during an overtaking manoeuvre: stopping
+  // half-way through a turn out of the lane would leave the car beside the line)
+  if (direction != stop_it && !Overtaking && RedStop_MustStop())
   {
     direction = stop_it;
   }
@@ -625,11 +632,11 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SensorDataUpdate(void)
 
   { /*value updation for the IR sensors on the line tracking module：for the line tracking mode*/
     TrackingData_R = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_R();
-    TrackingDetectionStatus_R = function_xxx(TrackingData_R, TrackingDetection_S, TrackingDetection_E);
+    TrackingDetectionStatus_R = function_xxx(TrackingData_R, TrackingDetection_SR, TrackingDetection_E);
     TrackingData_M = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_M();
-    TrackingDetectionStatus_M = function_xxx(TrackingData_M, TrackingDetection_S, TrackingDetection_E);
+    TrackingDetectionStatus_M = function_xxx(TrackingData_M, TrackingDetection_SM, TrackingDetection_E);
     TrackingData_L = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_L();
-    TrackingDetectionStatus_L = function_xxx(TrackingData_L, TrackingDetection_S, TrackingDetection_E);
+    TrackingDetectionStatus_L = function_xxx(TrackingData_L, TrackingDetection_SL, TrackingDetection_E);
     //ITR20001 Check if the car leaves the ground
     ApplicationFunctionSet_SmartRobotCarLeaveTheGround();
   }
@@ -774,7 +781,10 @@ static float Kinematics_PwmToWheel(int16_t pwm) // rad/s, signed
   these three numbers. Default: at the origin, pointing up the diagonal.
   Example: on the 1.2 m section, 0.3 m past the top-right corner, facing the crossing:
     START_X_M 1.95, START_Y_M -0.78, START_PSI_DEG 120*/
-#define START_X_M     0.0f
+// Start used for the gray-floor track: on the long diagonal, between the crossing (X = 1.50) and the
+// sharp right corner (X = 3.20), facing the sharp corner. 2.35 m = roughly halfway; measure the car
+// centre's distance past the crossing centre and put 1.50 + that distance here.
+#define START_X_M     2.35f
 #define START_Y_M     0.0f
 #define START_PSI_DEG 0.0f
 
@@ -1256,8 +1266,12 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Rocker(void)
     2. turn back the other way, up to SEARCH_BACK_DEG past the starting heading
     3. turn back to the starting heading, then give up (LINE_LOST) and stop.
   Which side first (Search_FirstSide):
-    a. near a corner of the track (fused position estimate within CORNER_NEAR_M): the direction
-       that corner turns. The estimate was within ~0.1 m of every corner in the 16:4x run.
+    a. which leg of the figure 8 the car is on (Search_FirstSide): the leg whose direction matches
+       the car's heading (within LEG_GATE_DEG) and that is closest to the position estimate. The
+       search turns the way the corner at the END of that leg turns. Heading comes from the gyro and
+       is accurate; the legs with similar headings are far apart, so this keeps working when the
+       position estimate is 0.5-1 m off along the track (the old "within 0.6 m of a corner" check
+       didn't, and fell back to "right first" at the 90 deg LEFT corner on the gray-floor track).
     b. otherwise the side sensor that saw the line in the last LAST_SIDE_FRESH_MS
     c. otherwise right first, like the original Elegoo search.
   History: the original search spun right 0.2 s then left, and every glimpse of the tape restarted
@@ -1271,44 +1285,81 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Rocker(void)
 #define SEARCH_TIMEOUT_MS   6000  // give up anyway after this long
 #define LAST_SIDE_FRESH_MS  300   // a side sensor reading older than this is stale
 #define GLIMPSE_MS          250   // line must be seen this long to end a search
-#define CORNER_NEAR_M       0.6f
+#define LEG_GATE_DEG        50    // the car's heading must be within this of a leg's direction
+#define LEG_GATE_M          1.0f  // ... and the estimate within this of the leg
 
-struct TrackCorner
+struct TrackLeg
 {
-  float x, y;
-  int8_t dir; // +1 = the track turns left here, -1 = right
+  float x0, y0, x1, y1; // m, start and end of the leg (track frame, see START_X_M)
+  int16_t psi;          // deg, direction of travel along the leg
+  int8_t next_dir;      // the corner at the end of the leg: +1 = turns left, -1 = right
 };
-// Corners of the figure 8 (track drawing, inertial frame, start = (0,0) facing up the diagonal)
-static const TrackCorner TRACK_CORNERS[] = {
-    {3.20f, 0.00f, -1},  // top left, 136.6 deg right
-    {2.10f, -1.04f, -1}, // top right, 103.4 deg right
-    {1.00f, 0.87f, 1},   // end of the 1 m section, 30 deg left
-    {0.63f, 1.08f, 1},   // 90 deg left
-    {0.00f, 0.00f, 1},   // back at the start, 120 deg left
+// The figure 8 in driving order (same corners as the track drawing)
+static const TrackLeg TRACK_LEGS[] = {
+    {0.00f, 0.00f, 3.20f, 0.00f, 0, -1},     // long diagonal, through the crossing -> 136.6 deg right
+    {3.20f, 0.00f, 2.10f, -1.04f, -137, -1}, // -> 103.4 deg right
+    {2.10f, -1.04f, 1.00f, 0.87f, 120, 1},   // 1.2 m section, stop sign, crossing, 1 m section -> 30 deg left
+    {1.00f, 0.87f, 0.63f, 1.08f, 150, 1},    // -> 90 deg left
+    {0.63f, 1.08f, 0.00f, 0.00f, -120, 1},   // 1.25 m section -> 120 deg left (start corner)
 };
-#define TRACK_CORNERS_N (sizeof(TRACK_CORNERS) / sizeof(TRACK_CORNERS[0]))
+#define TRACK_LEGS_N (sizeof(TRACK_LEGS) / sizeof(TRACK_LEGS[0]))
+
+// Distance from the position estimate to a leg (m)
+static float Leg_Dist(const TrackLeg &g)
+{
+  float dx = g.x1 - g.x0, dy = g.y1 - g.y0;
+  float t = ((Est_X - g.x0) * dx + (Est_Y - g.y0) * dy) / (dx * dx + dy * dy);
+  t = constrain(t, 0.0f, 1.0f);
+  return hypot(Est_X - (g.x0 + t * dx), Est_Y - (g.y0 + t * dy));
+}
 
 static int8_t line_last_side = -1;         // +1 = LEFT sensor saw the line last, -1 = RIGHT
 static unsigned long line_last_side_ms = 0; // when
 
 static int8_t Search_FirstSide(void)
 {
-  float best = CORNER_NEAR_M;
-  int8_t side = 0;
-  for (uint8_t i = 0; i < TRACK_CORNERS_N; i++)
+  // Just after an overtake the line is beside the car, not at a corner: use the side bug_pass() left
+  if ((long)(Search_Hint_Until - millis()) > 0)
   {
-    float d = hypot(TRACK_CORNERS[i].x - Est_X, TRACK_CORNERS[i].y - Est_Y);
+    Serial.print(F("{SEARCH,"));
+    Serial.print(Search_Hint_Side);
+    Serial.print(F(",pass}"));
+    return Search_Hint_Side;
+  }
+  float psi_deg = Est_Psi * (180.0f / PI);
+  float best = LEG_GATE_M;
+  int8_t side = 0, leg = -1;
+  for (uint8_t i = 0; i < TRACK_LEGS_N; i++)
+  {
+    float dpsi = fmod(psi_deg - TRACK_LEGS[i].psi, 360.0f); // wrap to -180..180
+    if (dpsi > 180)
+      dpsi -= 360;
+    if (dpsi < -180)
+      dpsi += 360;
+    if (fabs(dpsi) > LEG_GATE_DEG)
+      continue;
+    float d = Leg_Dist(TRACK_LEGS[i]);
     if (d < best)
     {
       best = d;
-      side = TRACK_CORNERS[i].dir;
+      side = TRACK_LEGS[i].next_dir;
+      leg = i;
     }
   }
-  if (side != 0)
-    return side;
-  if (millis() - line_last_side_ms < LAST_SIDE_FRESH_MS)
-    return line_last_side;
-  return -1;
+  if (side == 0)
+  {
+    if (millis() - line_last_side_ms < LAST_SIDE_FRESH_MS)
+      side = line_last_side;
+    else
+      side = -1;
+  }
+  // {SEARCH,first side (+1 left / -1 right),leg (-1 = none matched)}: shows on the ESP32's debug serial
+  Serial.print(F("{SEARCH,"));
+  Serial.print(side);
+  Serial.print(',');
+  Serial.print(leg);
+  Serial.print('}');
+  return side;
 }
 
 void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
@@ -1326,13 +1377,24 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
   // tried to move, so if the line search gave up during a stop-sign hold, the hold never ended
   // (the log showed STOP_SIGN forever while the car had really lost the line).
   
-  //Avoid obstacles
-
-  bug_pass(RHS);
-  if (estop_active || light_state != LIGHT_GO)
-    return; // E-stop pressed during the pass: don't drive until released and the light check has run
-
   RedStop_MustStop();
+
+  // Obstacle ahead -> overtake (movement.cpp). Only armed while really following the line: not
+  // during a line search (the sensor sees walls while the car spins at corners), not while stopped
+  // for red / a stop sign, and not right after finding the line again.
+  bool can_pass = Application_SmartRobotCarxxx0.Functional_Mode == TraceBased_mode &&
+                  Car_LeaveTheGround && track_state == TS_FOLLOW &&
+                  on_line && millis() - on_line_since >= 500 &&
+                  (red_state == RS_DRIVE || red_state == RS_COOLDOWN || red_state == RS_RED_IGNORE);
+  if (Obstacle_Ahead(can_pass))
+  {
+    bug_pass(Pass_Side());
+    timestamp = true; // if the line isn't under the sensors, start a fresh search
+    BlindDetection = true;
+    on_line = false;
+    if (estop_active || light_state != LIGHT_GO)
+      return; // E-stop pressed during the pass: don't drive until released and the light check has run
+  }
 
   if (Application_SmartRobotCarxxx0.Functional_Mode == TraceBased_mode)
   {
@@ -1344,9 +1406,9 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
     }
     track_state = TS_FOLLOW; // changed below if the line is lost
 
-    bool seen_M = function_xxx(TrackingData_M, TrackingDetection_S, TrackingDetection_E);
-    bool seen_R = function_xxx(TrackingData_R, TrackingDetection_S, TrackingDetection_E);
-    bool seen_L = function_xxx(TrackingData_L, TrackingDetection_S, TrackingDetection_E);
+    bool seen_M = function_xxx(TrackingData_M, TrackingDetection_SM, TrackingDetection_E);
+    bool seen_R = function_xxx(TrackingData_R, TrackingDetection_SR, TrackingDetection_E);
+    bool seen_L = function_xxx(TrackingData_L, TrackingDetection_SL, TrackingDetection_E);
     if (seen_M || seen_R || seen_L)
     {
       if (seen_M)

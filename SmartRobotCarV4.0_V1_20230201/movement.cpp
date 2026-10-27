@@ -1,15 +1,75 @@
-// Servo and ultrasonic checks
-
+// Obstacle detection and the Bug-algorithm overtaking manoeuvre
 
 #include "movement.h"
 
-// File for writing the bug algorithm and drag race to
+/*---------------- Overtaking (Bug algorithm) ----------------
+  Detection (Obstacle_Ahead): the front ultrasonic must read OBST_MIN_CM..OBST_DETECT_CM on
+  OBST_CONFIRM_N pings in a row, and only while the car is really following the line. Before, one
+  bad ping started a pass, and the sensor was also read while the car spun in a line search, so it
+  saw walls and chairs at the corners ("activates randomly").
 
+  Side (Pass_Side): always the OUTSIDE of the track. Both loops of the figure 8 meet at the crossing
+  (X = CROSSING_X): the right-turn loop is at X > CROSSING_X, so its outside is on the LEFT; the
+  left-turn loop is at X < CROSSING_X, so its outside is on the RIGHT. The point checked is a little
+  ahead of the car (where the obstacle is). Before, it always passed on the right.
 
+  Manoeuvre (bug_pass), each step closed-loop on the gyro and the position estimate:
+    1. turn PASS_OUT_DEG toward the pass side
+    2. drive out until PASS_OFFSET_M beside the line: half the obstacle + half the car + clearance
+    3. turn back parallel to the line, point the ultrasonic at the obstacle
+    4. drive beside it until the car's rear is past the obstacle's far end (worked out from where the
+       obstacle was measured and OBST_LENGTH_M) - the Bug "leave" point. If the side sensor still sees
+       something there (a robot moving the same way), keep going while it does, up to PASS_EXTRA_MAX_M.
+    5. turn PASS_OUT_DEG back toward the line
+    6. drive until an IR sensor sees the line (gives up after PASS_RETURN_MAX_M)
+    7. drive on SENSOR_AHEAD_M so the wheels are on the line, then turn parallel to it and hand back
+       to the line tracker (with a search hint toward the line in case it isn't under the sensors)
+  Before, the manoeuvre was timed, the side check never ran (first_time was already > 500 ms), and
+  the way back was shorter than the way out, so it ended ~0.2 m beside the line and lost it.
 
-// bug algorithm
+  Events sent to the ESP32 (shown as "UNO: ..." on its debug serial):
+    {OB,obstacle_x_mm,obstacle_y_mm,side}  pass started (side 0 = left, 1 = right)
+    {OV,time_ms,side,line_found}           pass finished
+*/
+#define OBST_DETECT_CM      20    // start a pass when the obstacle is this close ahead
+#define OBST_MIN_CM         3     // readings below this are noise
+#define OBST_CONFIRM_N      3     // close readings in a row needed to start a pass
+#define OBST_PING_MS        60    // HC-SR04 needs ~60 ms between pings or it hears the last echo
+#define OBST_AFTER_PASS_MS  3000  // no new pass this soon after the last one
+
+#define CROSSING_X          1.50f // m, X of the crossing in the track frame (see START_X_M / TRACK_LEGS)
+#define SIDE_LOOK_AHEAD_M   0.30f // decide the side at this point ahead of the car (at the obstacle)
+
+#define PASS_SPEED          100
+#define PASS_OUT_DEG        45    // angle out of and back into the lane
+// Size of the pass. Measure your obstacle and car and set these; everything below follows from them.
+#define OBST_WIDTH_M        0.10f // obstacle size ACROSS the track
+#define OBST_LENGTH_M       0.10f // obstacle size ALONG the track
+#define CAR_HALF_WIDTH_M    0.10f // half the car's width
+#define CAR_HALF_LEN_M      0.13f // car centre to its back bumper
+#define US_AHEAD_M          0.10f // front ultrasonic is this far ahead of the car centre
+#define PASS_CLEARANCE_M    0.04f // gap kept between the car and the obstacle
+// Car centre this far beside the line while passing: just enough for the car to miss the obstacle
+#define PASS_OFFSET_M       (OBST_WIDTH_M / 2 + CAR_HALF_WIDTH_M + PASS_CLEARANCE_M)
+#define PASS_OUT_MAX_M      (PASS_OFFSET_M * 1.41f + 0.10f) // give up driving out after this far (45 deg)
+#define PASS_RETURN_MAX_M   (PASS_OFFSET_M * 1.41f + 0.15f) // drive at most this far looking for the line
+#define PASS_SIDE_SEE_CM    25    // side ultrasonic: obstacle is still beside the car if closer than this
+#define PASS_EXTRA_MAX_M    0.40f // keep going at most this much further while it is (moving robot)
+#define SENSOR_AHEAD_M      0.10f // line sensors are about this far ahead of the wheel axle (measure it)
+#define HOLD_GAIN           3     // PWM per degree of heading error while driving beside the obstacle
+#define SERVO_LEFT          180   // servo angles (Elegoo: 30 = right, 150 = left)
+#define SERVO_RIGHT         0
+#define SERVO_AHEAD         90
+
+#define TURN_SPEED          100
+#define TURN_LEAD_DEG       12    // stop turning this early: the car keeps turning ~10-15 deg after the
+                                  // motors stop. If turns overshoot raise it, if they stop short lower it.
+#define TURN_TIMEOUT_MS     2500
 
 bool Overtaking = false;
+int8_t Search_Hint_Side = 0;
+unsigned long Search_Hint_Until = 0;
+static unsigned long last_pass_end = 0;
 
 // Returns false (early) if the web E-stop was pressed during the wait
 bool delay_kinematics(unsigned long ms)
@@ -23,9 +83,8 @@ bool delay_kinematics(unsigned long ms)
     if (estop || (Overtaking && EStop_Pressed)) // pressed during the pass, even if already released
       return false;
     Kinematics_Update();
-    // optional, keeps Heading_Gyro fresh for the fusion term
-    Application_FunctionSet.ApplicationFunctionSet_Telemetry(false); //Gets gyro data or something
-    //function could probably be named better
+    // keeps Heading_Gyro fresh and sends telemetry (state OVERTAKING) during the pass
+    Application_FunctionSet.ApplicationFunctionSet_Telemetry(false);
   }
   return true;
 }
@@ -36,6 +95,7 @@ extern Servo myservo; // DeviceDriverSet_xxx0.cpp
 static void abort_pass(void)
 {
   Overtaking = false;
+  last_pass_end = millis();
   ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
   Serial.print(F("{OVERTAKE ABORTED - E-STOP}"));
 
@@ -43,7 +103,7 @@ static void abort_pass(void)
   // can't be used here: its 450 ms wait (delay_kinematics) ends at once while the E-stop is on.
   // The ESP32 isn't read during this wait, so a quick E-stop release can't start the car mid-move.
   myservo.attach(PIN_Servo_z);
-  myservo.write(90);
+  myservo.write(SERVO_AHEAD);
   unsigned long t0 = millis();
   while (millis() - t0 < 450)
   {
@@ -54,157 +114,227 @@ static void abort_pass(void)
   myservo.detach();
 }
 
-bool checkLine(void){
-
+static bool checkLine(void)
+{
   uint32_t TrackingData_R = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_R();
   uint32_t TrackingData_M = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_M();
   uint32_t TrackingData_L = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_L();
-            
-  bool seen_M = function_xxx(TrackingData_M, Application_FunctionSet.TrackingDetection_S, Application_FunctionSet.TrackingDetection_E);
-  bool seen_R = function_xxx(TrackingData_R, Application_FunctionSet.TrackingDetection_S, Application_FunctionSet.TrackingDetection_E);
-  bool seen_L = function_xxx(TrackingData_L, Application_FunctionSet.TrackingDetection_S, Application_FunctionSet.TrackingDetection_E);
 
-  if(seen_M || seen_R || seen_L){
-    return true;
-  }
-  
-  return false;
-  
+  bool seen_M = function_xxx(TrackingData_M, Application_FunctionSet.TrackingDetection_SM, Application_FunctionSet.TrackingDetection_E);
+  bool seen_R = function_xxx(TrackingData_R, Application_FunctionSet.TrackingDetection_SR, Application_FunctionSet.TrackingDetection_E);
+  bool seen_L = function_xxx(TrackingData_L, Application_FunctionSet.TrackingDetection_SL, Application_FunctionSet.TrackingDetection_E);
+
+  return seen_M || seen_R || seen_L;
 }
 
-bool crossLineFix(SmartRobotCarMotionControl dir){ //Fixes center of obj
-  if(checkLine()){ //Checks for a line (corner cutting, etc.) assumes that the "turning point is the centrod of the object"
-    
-    uint32_t TrackingData_M = AppITR20001.DeviceDriverSet_ITR20001_getAnaloguexxx_M();
-    if(function_xxx(TrackingData_M, Application_FunctionSet.TrackingDetection_S, Application_FunctionSet.TrackingDetection_E)){
-      ApplicationFunctionSet_SmartRobotCarMotionControl(dir, 100);
-      delay_kinematics(3000); //for testing
-      return true;
-    }
-  }
-  return false;
+static float wrap180(float deg)
+{
+  while (deg > 180)
+    deg -= 360;
+  while (deg < -180)
+    deg += 360;
+  return deg;
 }
 
+// One ultrasonic reading (cm), 0 = nothing in range. Rate-limited to one ping per OBST_PING_MS.
+static uint16_t ping_cm(void)
+{
+  static unsigned long last = 0;
+  static uint16_t last_cm = 0;
+  if (millis() - last < OBST_PING_MS)
+    return last_cm;
+  last = millis();
+  AppULTRASONIC.DeviceDriverSet_ULTRASONIC_Get(&last_cm /*out*/);
+  return last_cm;
+}
 
+bool Obstacle_Ahead(bool armed)
+{
+  static uint8_t close_count = 0;
+  static unsigned long last_checked = 0;
+  if (!armed || millis() - last_pass_end < OBST_AFTER_PASS_MS)
+  {
+    close_count = 0;
+    return false;
+  }
+  if (millis() - last_checked < OBST_PING_MS)
+    return false;
+  last_checked = millis();
+  uint16_t d = ping_cm();
+  if (d >= OBST_MIN_CM && d <= OBST_DETECT_CM)
+    close_count++;
+  else
+    close_count = 0;
+  return close_count >= OBST_CONFIRM_N;
+}
 
+side Pass_Side(void)
+{
+  float x_ahead = Est_X + SIDE_LOOK_AHEAD_M * cos(Est_Psi);
+  return (x_ahead > CROSSING_X) ? LHS : RHS; // right-turn loop: pass on the left; left-turn loop: on the right
+}
 
-
-
-// Returns false if the E-stop was pressed
-static bool turn_to_heading(float target_deg, unsigned long timeout_ms)
+// Turn on the spot to target_deg (gyro heading, + = left). Returns false if the E-stop was pressed.
+static bool turn_to_heading(float target_deg)
 {
   unsigned long t0 = millis();
-  while (millis() - t0 < timeout_ms) {
-    float err = target_deg - Heading_Gyro - 20.0f; //the -20 is for tuning purposes
-    float er  = err * (PI / 180.0f);
-    err = atan2f(sinf(er), cosf(er)) * (180.0f / PI);   // wrap to ±180
-
-    if (fabs(err) < 3.0f) break;
-
-    // Pulse and speed both shrink with error, so the last pulse can't overshoot
-    
-
-    if (err > 0)
-      ApplicationFunctionSet_SmartRobotCarMotionControl(Left,  100);
-    else
-      ApplicationFunctionSet_SmartRobotCarMotionControl(Right, 100);
-
-    if (!delay_kinematics(200)) return false;
-
-    
-    
+  while (millis() - t0 < TURN_TIMEOUT_MS)
+  {
+    float err = wrap180(target_deg - Heading_Gyro);
+    if (fabs(err) <= TURN_LEAD_DEG)
+      break;
+    ApplicationFunctionSet_SmartRobotCarMotionControl(err > 0 ? Left : Right, TURN_SPEED);
+    if (!delay_kinematics(10))
+      return false;
   }
   ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
-  return true;
+  return delay_kinematics(150); // let it settle so the next step starts from a steady heading
 }
 
-void bug_pass(uint8_t goto_side){
+// Drive forward holding heading_deg (A = right side, B = left side). Call in a loop.
+static void drive_holding(float heading_deg)
+{
+  int16_t corr = (int16_t)(HOLD_GAIN * wrap180(heading_deg - Heading_Gyro)); // + = steer left
+  corr = constrain(corr, -40, 40);
+  AppMotor.DeviceDriverSet_Motor_control(direction_just, PASS_SPEED + corr,
+                                         direction_just, PASS_SPEED - corr, control_enable);
+}
 
-  Serial.println("trying to pass");
-  uint16_t distance = 150; //distance in CM
-  uint16_t distance_thresh = 20;
-  uint16_t sideview_thresh = 20;
+static float dist_from(float x0, float y0)
+{
+  return hypot(Est_X - x0, Est_Y - y0);
+}
 
-  bool look4line = false;
+static void look(uint8_t angle)
+{
+  AppServo.DeviceDriverSet_Servo_control(angle); // 450 ms, through delay_kinematics
+}
 
-  side pass_side = goto_side;
-
-  AppULTRASONIC.DeviceDriverSet_ULTRASONIC_Get(&distance /*out*/);
-
-  Serial.println(distance);
-  if(distance > distance_thresh || distance == 0) return;
-
+void bug_pass(side s)
+{
   Overtaking = true;
   EStop_Pressed = false; // only presses from now on cancel this pass
-  uint32_t overtake_start = millis();
-
-  const bool     is_lhs     = (pass_side == LHS);
-  const SmartRobotCarMotionControl spin       = is_lhs ? Left  : Right;
-  const SmartRobotCarMotionControl spin_rev = is_lhs ? Right : Left;
-  const uint8_t  look_angle = is_lhs ? 0 : 180;
-
-  if (!delay_kinematics(10)) return abort_pass(); //could find more elegant way to impliement this
-  float yaw_0 = Heading_Gyro;
-
-  
-
-  ApplicationFunctionSet_SmartRobotCarMotionControl(spin, 100);
-
-  uint32_t t_departed1 = millis();
-  
-  if (!delay_kinematics(300)) return abort_pass();
-  
-  ApplicationFunctionSet_SmartRobotCarMotionControl(Forward, 100);
-
-  uint32_t first_time = millis() - t_departed1;
-
-  AppServo.DeviceDriverSet_Servo_control(look_angle); //move this around
-  if (EStop_Pressed) return abort_pass(); // E-stop during the servo move
-
-  
-  
-  
-  
-
-  AppULTRASONIC.DeviceDriverSet_ULTRASONIC_Get(&distance /*out*/);
-  
-  while(distance < sideview_thresh && (first_time < 500)){
-    AppULTRASONIC.DeviceDriverSet_ULTRASONIC_Get(&distance /*out*/);
-    if (!delay_kinematics(50)) return abort_pass();
-    first_time = millis() - t_departed1;
-  }
-
-  if (!delay_kinematics(1200)) return abort_pass(); //could add line seeing here
-
-  first_time = millis() - t_departed1;
-
-  uint32_t t_departed2 = millis();
-  
-
-  ApplicationFunctionSet_SmartRobotCarMotionControl(spin_rev, 100);
-  if (!delay_kinematics(600)) return abort_pass();
-
-  ApplicationFunctionSet_SmartRobotCarMotionControl(Forward, 100);
-  AppServo.DeviceDriverSet_Servo_control(90);
-  if (EStop_Pressed) return abort_pass(); // E-stop during the servo move
-  uint32_t second_time = millis() - t_departed2;
-  while(first_time > second_time){
-    if(look4line) crossLineFix(spin);
-    if (!delay_kinematics(50)) return abort_pass();
-    second_time = millis() - t_departed2; 
-       
-    }
-
-  // ApplicationFunctionSet_SmartRobotCarMotionControl(spin_rev, 100);
-  // delay_kinematics(300);
-
-  if (!turn_to_heading(yaw_0,3000)) return abort_pass();
+  unsigned long t_start = millis();
+  const int8_t sgn = (s == LHS) ? 1 : -1; // +1 = pass on the left (heading + = left)
 
   ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
-  if (!delay_kinematics(1000)) return abort_pass();
+  uint16_t d_cm = ping_cm();
+  if (!delay_kinematics(150))
+    return abort_pass();
+
+  // Where is the obstacle? (inertial frame, for the log)
+  float ob_x = Est_X + d_cm * 0.01f * cos(Est_Psi);
+  float ob_y = Est_Y + d_cm * 0.01f * sin(Est_Psi);
+  Serial.print(F("{OB,"));
+  Serial.print((long)(ob_x * 1000));
+  Serial.print(',');
+  Serial.print((long)(ob_y * 1000));
+  Serial.print(',');
+  Serial.print((int)s);
+  Serial.print('}');
+
+  const float yaw0 = Heading_Gyro; // direction of the line here
+  const float x0 = Est_X, y0 = Est_Y;
+  const float c0 = cos(yaw0 * (PI / 180.0f)), s0 = sin(yaw0 * (PI / 180.0f));
+  #define LATERAL() (-(Est_X - x0) * s0 + (Est_Y - y0) * c0) // m beside the line, + = left
+  #define ALONG() ((Est_X - x0) * c0 + (Est_Y - y0) * s0)    // m along the line from where it stopped
+  // The car centre is level with the obstacle's far end + car half-length + clearance -> rear is clear
+  const float d_m = (d_cm >= OBST_MIN_CM && d_cm <= 60) ? d_cm * 0.01f : OBST_DETECT_CM * 0.01f;
+  const float pass_along = US_AHEAD_M + d_m + OBST_LENGTH_M + CAR_HALF_LEN_M + PASS_CLEARANCE_M;
+
+  // 1. turn out toward the pass side
+  if (!turn_to_heading(yaw0 + sgn * PASS_OUT_DEG))
+    return abort_pass();
+
+  // 2. drive out until PASS_OFFSET_M beside the line
+  float px = Est_X, py = Est_Y;
+  while (sgn * LATERAL() < PASS_OFFSET_M && dist_from(px, py) < PASS_OUT_MAX_M)
+  {
+    drive_holding(yaw0 + sgn * PASS_OUT_DEG);
+    if (!delay_kinematics(10))
+      return abort_pass();
+  }
+
+  // 3. parallel to the line, ultrasonic looking at the obstacle (on the side away from the pass)
+  if (!turn_to_heading(yaw0))
+    return abort_pass();
+  look(s == LHS ? SERVO_RIGHT : SERVO_LEFT);
+  if (EStop_Pressed)
+    return abort_pass();
+
+  // 4. drive beside the obstacle until the car is past it (Bug "leave" point). The distance comes
+  //    from where the obstacle was measured and its size, so a small obstacle gives a short pass.
+  //    If the side sensor still sees something there (another robot moving the same way), keep
+  //    going while it does, up to PASS_EXTRA_MAX_M more.
+  unsigned long last_ping = 0;
+  bool beside = false;
+  while (ALONG() < pass_along || (beside && ALONG() < pass_along + PASS_EXTRA_MAX_M))
+  {
+    drive_holding(yaw0);
+    if (millis() - last_ping >= OBST_PING_MS)
+    {
+      last_ping = millis();
+      uint16_t d = ping_cm();
+      beside = d >= OBST_MIN_CM && d <= PASS_SIDE_SEE_CM;
+    }
+    if (!delay_kinematics(10))
+      return abort_pass();
+  }
+  ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
+  look(SERVO_AHEAD);
+  if (EStop_Pressed)
+    return abort_pass();
+
+  // 5. turn back toward the line
+  if (!turn_to_heading(yaw0 - sgn * PASS_OUT_DEG))
+    return abort_pass();
+
+  // 6. drive until a line sensor sees the tape
+  px = Est_X;
+  py = Est_Y;
+  bool found = false;
+  while (dist_from(px, py) < PASS_RETURN_MAX_M)
+  {
+    if (checkLine())
+    {
+      found = true;
+      break;
+    }
+    drive_holding(yaw0 - sgn * PASS_OUT_DEG);
+    if (!delay_kinematics(5))
+      return abort_pass();
+  }
+
+  // 7. wheels onto the line, then line up with it
+  if (found)
+  {
+    px = Est_X;
+    py = Est_Y;
+    while (dist_from(px, py) < SENSOR_AHEAD_M)
+    {
+      drive_holding(yaw0 - sgn * PASS_OUT_DEG);
+      if (!delay_kinematics(5))
+        return abort_pass();
+    }
+  }
+  if (!turn_to_heading(yaw0))
+    return abort_pass();
+
+  // In case the line isn't under the sensors now: for the next 3 s the tracker's line search turns
+  // toward the side the line should be on first. Still on the pass side of it -> back toward it;
+  // already past it (line not seen on the way back) -> the other way.
+  Search_Hint_Side = (sgn * LATERAL() > 0) ? -sgn : sgn;
+  Search_Hint_Until = millis() + 3000;
+  #undef LATERAL
+  #undef ALONG
 
   Overtaking = false;
-  Serial.print(F("{OVERTAKE DONE,"));
-  Serial.print(millis() - overtake_start); // how long the pass took, ms
+  last_pass_end = millis();
+  Serial.print(F("{OV,"));
+  Serial.print(millis() - t_start); // how long the pass took, ms
+  Serial.print(',');
+  Serial.print((int)s);
+  Serial.print(',');
+  Serial.print(found ? 1 : 0);
   Serial.print('}');
 }

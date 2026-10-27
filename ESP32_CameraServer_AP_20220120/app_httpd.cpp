@@ -44,10 +44,11 @@
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
-#define STOP_CHECK_MIN_PX 100   // only run the stop sign model on red blobs at least this big
+#define STOP_CHECK_MIN_PX 60    // only run the stop sign model on red blobs at least this big
                                 // KEEP THIS EQUAL TO RED_STOP_MIN_PX ON THE UNO
-                                // (was 150: glare makes the sign count fewer red pixels, so it
-                                //  only reached 150 when the car was already too close)
+                                // (was 150, then 100: a sign off to the side of the track is farther
+                                //  away and seen at an angle, so it only reached 100 px when it was
+                                //  nearly in front of the camera. Lower = reacts from farther away.)
 #define DETECT_DELAY_MS   100   // pause between detection frames (was 500)
 
 #define I_RES        2
@@ -55,13 +56,15 @@
 #define MAX_BLOBS    6
 
 // ---- Red colour thresholds (FIX 2) ----
-// Red is stricter than green/blue because orange, skin, wood and warm light were
-// passing as red. Measure your sign with HSV_PROBE below and adjust these.
-// (first try was 12 / 345 / 0.50 / 0.30 - too strict, missed the sign)
-#define RED_HUE_LOW_MAX   20     // red if hue <= this ...
-#define RED_HUE_HIGH_MIN  340    // ... or hue >= this (red wraps around 0/360)
-#define RED_MIN_SAT       0.40f  // raise to reject pinkish / washed-out red, lower if the sign is missed
-#define RED_MIN_VAL       0.25f  // raise to reject dark reddish shadows
+// These were made strict for the old room (brown/orange walls, poor lighting), where orange, wood
+// and warm light passed as red. The new room has good light and few background objects, so they
+// are relaxed so the sign is also picked up off to the side (darker image edges, seen at an angle).
+// Old-room values: 20 / 340 / 0.40 / 0.25. First new-room try: 20 / 340 / 0.30 / 0.18. Measure with HSV_PROBE below if you need to retune.
+// If background things start showing as red boxes on /stream, raise RED_MIN_SAT first.
+#define RED_HUE_LOW_MAX   25     // red if hue <= this ...
+#define RED_HUE_HIGH_MIN  335    // ... or hue >= this (red wraps around 0/360)
+#define RED_MIN_SAT       0.25f  // raise to reject pinkish / washed-out red, lower if the sign is missed
+#define RED_MIN_VAL       0.15f  // raise to reject dark reddish shadows
 
 // 1 = every ~1 s, print the H/S/V of the centre pixel (draws a white cross there
 //     on the /stream view). Point the centre of the camera at the sign, then at
@@ -72,10 +75,12 @@
 // ---- Red blob shape filter (FIX 3) ----
 // A real sign is a solid, roughly square blob. Lighting noise and distant objects
 // make sparse, stretched blobs that used to add up past STOP_CHECK_MIN_PX.
-#define RED_MIN_FILL      0.15f  // red pixels must cover at least this much of the blob's box
+#define RED_MIN_FILL      0.08f  // red pixels must cover at least this much of the blob's box
+                                 // (0.15 in the old room, then 0.10; an angled sign far to the side reads sparser)
                                  // (measured: the real sign reads 0.22; tried 0.40 and 0.30, both rejected it)
-#define RED_MIN_ASPECT    0.30f  // allowed box width/height ratio - only rejects thin strips (tape, edges)
-#define RED_MAX_ASPECT    3.30f  // (skipped when the box touches the frame edge, i.e. sign is very close)
+#define RED_MIN_ASPECT    0.25f  // allowed box width/height ratio - only rejects thin strips (tape, edges)
+#define RED_MAX_ASPECT    4.00f  // (skipped when the box touches the frame edge, i.e. sign is very close)
+                                 // (0.30-3.30 in the old room)
                                  // first try was 0.60-1.60, but glare makes only part of the sign count as
                                  // red, so it measured ~20x52 (0.38) and was rejected
 
@@ -286,13 +291,13 @@ char find_colour(uint8_t r, uint8_t g, uint8_t b)
 {
     hsv_t c_hsv = rgb_to_hsv(r, g, b);
 
-    if (c_hsv.V < 0.25 || c_hsv.S < 0.35) {
-        return '0';
-    }
+    // Green / blue keep the old general limits (S >= 0.35, V >= 0.25); red uses its own
+    // RED_MIN_SAT / RED_MIN_VAL (this gate used to apply to red too, which overrode them)
+    bool vivid = c_hsv.V >= 0.25 && c_hsv.S >= 0.35;
 
-    if (210 <= c_hsv.H && c_hsv.H <= 270) {
+    if (vivid && 210 <= c_hsv.H && c_hsv.H <= 270) {
         return 'B';
-    } else if (90 <= c_hsv.H && c_hsv.H <= 150) {   // <-- was `90 <= H <= 150`
+    } else if (vivid && 90 <= c_hsv.H && c_hsv.H <= 150) {   // <-- was `90 <= H <= 150`
         return 'G';
     } else if ((c_hsv.H <= RED_HUE_LOW_MAX || c_hsv.H >= RED_HUE_HIGH_MIN) &&
                c_hsv.S >= RED_MIN_SAT && c_hsv.V >= RED_MIN_VAL) {

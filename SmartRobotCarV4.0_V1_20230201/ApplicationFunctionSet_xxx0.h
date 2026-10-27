@@ -105,9 +105,22 @@ public:
   uint8_t Rocker_temp;
 
 public:
-  uint8_t TrackingDetection_S = 250;
-  uint16_t TrackingDetection_E = 850;
-  uint16_t TrackingDetection_V = 950;
+  // Line sensor thresholds for BLACK TAPE ON GRAY FLOOR (measured with LineSensor_Calibration.ino,
+  // two spots on the track). A sensor is on the line when  its threshold <= reading <= TrackingDetection_E.
+  // The three sensors read very differently on the same floor, so each has its own threshold:
+  //            floor max   tape        lifted
+  //   L (A2)   707         845-886     ~1003
+  //   M (A1)   364         699-737     ~998
+  //   R (A0)   581         809-843     ~1007
+  // Thresholds are halfway between floor max and tape min. L has the least margin (~70 each side):
+  // if the car sees the line on bare floor, raise L; if it misses the tape, lower it.
+  uint16_t TrackingDetection_SL = 775;
+  uint16_t TrackingDetection_SM = 530;
+  uint16_t TrackingDetection_SR = 695;
+  uint16_t TrackingDetection_S = 250;  // old single threshold, only used by the unused IR-remote code
+                                        // (was uint8_t, which can't hold the new values above 255)
+  uint16_t TrackingDetection_E = 940;  // between the tape max (886) and lifted (~996). Was 850.
+  uint16_t TrackingDetection_V = 950;  // all three above this = car lifted off the ground
 
 public:
   uint8_t CMD_is_Servo;
