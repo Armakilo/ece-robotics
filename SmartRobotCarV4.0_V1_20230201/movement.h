@@ -19,6 +19,17 @@ extern DeviceDriverSet_Motor AppMotor;
 
 bool delay_kinematics(unsigned long ms); // false if the E-stop was pressed during the wait
 
+// Car / obstacle dimensions shared with the position estimate (MEASURE them)
+#define SENSOR_AHEAD_M      0.10f // line sensors are this far ahead of the wheel axle (car centre)
+#define US_AHEAD_M          0.10f // front ultrasonic is this far ahead of the car centre
+#define OBST_LENGTH_M       0.10f // obstacle (moose) size ALONG the track
+
+// Position fix from the moose (ApplicationFunctionSet_xxx0.cpp); false = not the moose / rejected
+bool Obstacle_Fix(float range_m, float *dx, float *dy);
+float Track_Dist(float x, float y);       // m from the point to the nearest track section
+float Ekf_PosSigma(void);                 // m, position estimate uncertainty (1 sigma)
+bool Track_LineHeading(float *gyro_deg);  // direction of the section the car is on (gyro frame), false = unknown
+
 // Obstacle ahead, confirmed by several pings in a row. Call every loop; armed = false (not following
 // the line, stopped, searching...) clears the count so the car can't start a pass then.
 bool Obstacle_Ahead(bool armed);

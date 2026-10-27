@@ -4,15 +4,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#define LOG_SECONDS     90   // keep only the newest 90 s of data (a full figure-8 lap with stops), the oldest rows are dropped
+#define LOG_SECONDS     300  // keep the newest 300 s of data (~6 laps with stops and passes), the oldest rows are dropped
+                             // (was 90 s, only ~2 laps). 1500 rows x 172 B = 258 KB in PSRAM.
 #define LOG_RATE_HZ     5    // the UNO sends 5 rows per second
 #define LOG_ROWS        (LOG_SECONDS * LOG_RATE_HZ)
 #define LOG_HEADER      "time_ms,heading_gyro,heading_pred,x_pred_m,y_pred_m,heading_est,x_est_m,y_est_m," \
-                        "lap_time_s,lap_dist_m,laps,state," \
+                        "lap_time_s,lap_dist_m,laps,state,pos_sigma_m,speed_scale," \
                         "sign_stop_x_m,sign_stop_y_m,sign_x_m,sign_y_m,cam_fix_dx_m,cam_fix_dy_m,map_match," \
-                        "lap_done,lap_done_time_s,lap_done_dist_m,lap_avg_speed_mps\n"
+                        "lap_done,lap_done_time_s,lap_done_dist_m,lap_avg_speed_mps," \
+                        "corner_leg,corner_car_x_m,corner_car_y_m,corner_fix_dx_m,corner_fix_dy_m,corner_used," \
+                        "obst_x_m,obst_y_m,pass_side,obst_fix_dx_m,obst_fix_dy_m,obst_fix_used," \
+                        "pass_time_s,pass_line_found," \
+                        "light_car_x_m,light_car_y_m,light_x_m,light_y_m,light_fix_dx_m,light_fix_dy_m\n"
 #define SNAPSHOT_PATH   "/log.bin"
-#define SNAPSHOT_MS     5000 // save the rows to flash at most this often, so they survive an ESP32 reset
 // Saving ~40 KB to flash blocks the ESP32 for about a second, and the UNO rows sent during that
 // time were lost (the 16:2x log was missing ~1 s every 5 s, including a stop-sign event).
 // So the snapshot is only saved while the car is E-stopped, never during a run.
@@ -31,6 +35,8 @@ struct LogRow {
     uint16_t lap_ds; // current lap time, tenths of a second
     uint16_t lap_cm; // current lap distance, cm
     uint8_t laps;    // laps completed
+    uint16_t sig_mm; // EKF position uncertainty (1 sigma), mm
+    uint16_t scale;  // EKF speed scale x 1000
     char state[13];
     // Events, only filled on the row right after they happened (blank in the CSV otherwise)
     bool sign;           // stopped at a stop sign ({SG,...} from the UNO)
@@ -45,6 +51,19 @@ struct LogRow {
     uint8_t lap_n;
     uint32_t lap_ms;
     uint32_t lap_mm;
+    bool cf;             // corner fix ({CF,leg,car_x,car_y,fix_dx,fix_dy,used})
+    int8_t cf_leg;
+    int32_t cf_x, cf_y, cf_dx, cf_dy; // car estimate before the fix, and the fix (mm)
+    bool cf_used;
+    bool ob;             // overtake started ({OB,obst_x,obst_y,side,fix_dx,fix_dy,used})
+    int32_t ob_x, ob_y, ob_dx, ob_dy; // obstacle estimate (before the moose fix), and the fix (mm)
+    uint8_t ob_side;     // 0 = passed on the left, 1 = right
+    bool ob_used;
+    bool ov;             // overtake finished ({OV,ms,side,line_found})
+    uint32_t ov_ms;
+    bool ov_found;
+    bool tl;             // traffic light seen ({TL,car_x,car_y,light_x,light_y,fix_dx,fix_dy})
+    int32_t tl_cx, tl_cy, tl_x, tl_y, tl_dx, tl_dy;
 };
 
 // Events waiting for the next {T,...} row, and the latest ones for the web page
@@ -54,12 +73,12 @@ static LogRow last_lap = {};
 
 // Ring buffer of the newest LOG_ROWS rows. Written by loop(), read by the web server task.
 static SemaphoreHandle_t log_mutex = NULL;
-static LogRow *rows = NULL; // LOG_ROWS rows (~23 KB), allocated in PSRAM by telemetry_init()
+static LogRow *rows = NULL; // LOG_ROWS rows (~258 KB), allocated in PSRAM by telemetry_init()
 #define ROWS_BYTES (sizeof(LogRow) * LOG_ROWS)
 static uint16_t head = 0;  // slot the next row goes in
 static uint16_t count = 0; // rows stored
 static bool fs_ok = false;
-static unsigned long last_snapshot = 0;
+static bool unsaved = false; // rows have arrived since the last snapshot
 static unsigned long last_rx = 0; // ESP32 millis() when the last row arrived
 
 // i-th oldest row. Call with log_mutex held.
@@ -142,20 +161,31 @@ void telemetry_handle_uno_msg(const String &msg)
     if (extra.length())
         Serial.println("UNO: " + extra);
 
-    // Events: {SG,stop_x,stop_y,sign_x,sign_y,fix_dx,fix_dy,match}  {LP,n,ms,mm}
-    if (msg.startsWith("{SG,", start) || msg.startsWith("{LP,", start)) {
+    // Events (attached to the next {T,...} row):
+    //   {SG,car_x,car_y,sign_x,sign_y,fix_dx,fix_dy,match}  stop sign     {LP,n,ms,mm}  lap done
+    //   {CF,leg,car_x,car_y,fix_dx,fix_dy,used}             corner fix
+    //   {OB,obst_x,obst_y,side,fix_dx,fix_dy,used}          overtake started
+    //   {OV,ms,side,line_found}                             overtake finished
+    //   {TL,car_x,car_y,light_x,light_y,fix_dx,fix_dy}      traffic light fix
+    static const char *const EVENTS[] = {"{SG,", "{LP,", "{CF,", "{OB,", "{OV,", "{TL,"};
+    int ev_i = -1;
+    for (int k = 0; k < 6; k++)
+        if (msg.startsWith(EVENTS[k], start))
+            ev_i = k;
+    if (ev_i >= 0) {
         Serial.println("UNO: " + msg.substring(start));
-        char ev[96];
+        char ev[112];
         msg.substring(start + 4).toCharArray(ev, sizeof(ev));
-        long v[7] = {0};
+        long v[8] = {0};
         char *p = ev;
-        for (int i = 0; i < 7 && *p && *p != '}'; i++) {
+        for (int i = 0; i < 8 && *p && *p != '}'; i++) {
             v[i] = strtol(p, &p, 10);
             if (*p == ',')
                 p++;
         }
         xSemaphoreTake(log_mutex, portMAX_DELAY);
-        if (msg[start + 1] == 'S') {
+        switch (ev_i) {
+        case 0:
             pending.sign = true;
             pending.stop_x_mm = v[0];
             pending.stop_y_mm = v[1];
@@ -165,12 +195,46 @@ void telemetry_handle_uno_msg(const String &msg)
             pending.fix_dy_mm = v[5];
             pending.match = v[6];
             last_sign = pending;
-        } else {
+            break;
+        case 1:
             pending.lap = true;
             pending.lap_n = v[0];
             pending.lap_ms = v[1];
             pending.lap_mm = v[2];
             last_lap = pending;
+            break;
+        case 2:
+            pending.cf = true;
+            pending.cf_leg = v[0];
+            pending.cf_x = v[1];
+            pending.cf_y = v[2];
+            pending.cf_dx = v[3];
+            pending.cf_dy = v[4];
+            pending.cf_used = v[5] != 0;
+            break;
+        case 3:
+            pending.ob = true;
+            pending.ob_x = v[0];
+            pending.ob_y = v[1];
+            pending.ob_side = v[2];
+            pending.ob_dx = v[3];
+            pending.ob_dy = v[4];
+            pending.ob_used = v[5] != 0;
+            break;
+        case 4:
+            pending.ov = true;
+            pending.ov_ms = v[0];
+            pending.ov_found = v[2] != 0;
+            break;
+        case 5:
+            pending.tl = true;
+            pending.tl_cx = v[0];
+            pending.tl_cy = v[1];
+            pending.tl_x = v[2];
+            pending.tl_y = v[3];
+            pending.tl_dx = v[4];
+            pending.tl_dy = v[5];
+            break;
         }
         xSemaphoreGive(log_mutex);
         return;
@@ -182,10 +246,10 @@ void telemetry_handle_uno_msg(const String &msg)
 
     if (!rows)
         return;
-    // Split "{T,time,gyro,pred,x,y,est,xe,ye,lap_ds,lap_cm,laps,state}" into fields.
+    // Split "{T,time,gyro,pred,x,y,est,xe,ye,lap_ds,lap_cm,laps,sig_mm,scale,state}" into fields.
     // pred can be empty, so no strtok.
-    const int NF = 12;
-    char buf[128];
+    const int NF = 14;
+    char buf[160];
     msg.substring(start + 3).toCharArray(buf, sizeof(buf));
     char *f[NF];
     char *p = buf;
@@ -211,7 +275,9 @@ void telemetry_handle_uno_msg(const String &msg)
     r.lap_ds = strtoul(f[8], NULL, 10);
     r.lap_cm = strtoul(f[9], NULL, 10);
     r.laps = strtoul(f[10], NULL, 10);
-    strlcpy(r.state, f[11], sizeof(r.state));
+    r.sig_mm = strtoul(f[11], NULL, 10);
+    r.scale = strtoul(f[12], NULL, 10);
+    strlcpy(r.state, f[13], sizeof(r.state));
 
     xSemaphoreTake(log_mutex, portMAX_DELAY);
     // attach any events that arrived since the last row
@@ -231,14 +297,50 @@ void telemetry_handle_uno_msg(const String &msg)
         r.lap_ms = pending.lap_ms;
         r.lap_mm = pending.lap_mm;
     }
-    pending.sign = pending.lap = false;
+    if (pending.cf) {
+        r.cf = true;
+        r.cf_leg = pending.cf_leg;
+        r.cf_x = pending.cf_x;
+        r.cf_y = pending.cf_y;
+        r.cf_dx = pending.cf_dx;
+        r.cf_dy = pending.cf_dy;
+        r.cf_used = pending.cf_used;
+    }
+    if (pending.ob) {
+        r.ob = true;
+        r.ob_x = pending.ob_x;
+        r.ob_y = pending.ob_y;
+        r.ob_side = pending.ob_side;
+        r.ob_dx = pending.ob_dx;
+        r.ob_dy = pending.ob_dy;
+        r.ob_used = pending.ob_used;
+    }
+    if (pending.ov) {
+        r.ov = true;
+        r.ov_ms = pending.ov_ms;
+        r.ov_found = pending.ov_found;
+    }
+    if (pending.tl) {
+        r.tl = true;
+        r.tl_cx = pending.tl_cx;
+        r.tl_cy = pending.tl_cy;
+        r.tl_x = pending.tl_x;
+        r.tl_y = pending.tl_y;
+        r.tl_dx = pending.tl_dx;
+        r.tl_dy = pending.tl_dy;
+    }
+    pending.sign = pending.lap = pending.cf = pending.ob = pending.ov = pending.tl = false;
     rows[head] = r;
     head = (head + 1) % LOG_ROWS;
     if (count < LOG_ROWS)
         count++;
     last_rx = millis();
-    if (fs_ok && strcmp(r.state, "ESTOP") == 0 && millis() - last_snapshot > SNAPSHOT_MS) {
-        last_snapshot = millis();
+    // Snapshot once per E-stop, and only if there is new data: with 300 s of rows a save takes several
+    // seconds, so re-saving every few seconds (as with the 90 s log) would block the ESP32 the whole stop.
+    if (strcmp(r.state, "ESTOP") != 0)
+        unsaved = true;
+    else if (fs_ok && unsaved) {
+        unsaved = false;
         save_snapshot();
     }
     xSemaphoreGive(log_mutex);
@@ -251,7 +353,7 @@ void telemetry_handle_uno_msg(const String &msg)
 //                "sign":{"sx":2.100,"sy":-0.200,"dx":0.050,"dy":-0.010,"m":0} or null}
 static esp_err_t data_handler(httpd_req_t *req)
 {
-    char json[600];
+    char json[680];
     char a[16] = "0.0", pr[16] = "null", xs[16], ys[16], es[16], xes[16], yes[16];
     char lapj[96] = "null", signj[128] = "null";
     LogRow r = {};
@@ -302,10 +404,12 @@ static esp_err_t data_handler(httpd_req_t *req)
     snprintf(json, sizeof(json),
              "{\"t\":%u,\"actual\":%s,\"pred\":%s,\"x\":%s,\"y\":%s,\"est\":%s,\"xe\":%s,\"ye\":%s,"
              "\"state\":\"%s\",\"age\":%lu,\"stale\":%s,\"log_secs\":%u,"
-             "\"lapt\":%u.%u,\"lapd\":%u.%02u,\"laps\":%u,\"lap\":%s,\"sign\":%s}",
+             "\"lapt\":%u.%u,\"lapd\":%u.%02u,\"laps\":%u,\"lap\":%s,\"sign\":%s,"
+             "\"sig\":%u.%03u,\"scale\":%u.%03u}",
              r.t, a, pr, xs, ys, es, xes, yes, r.state, age, (!ok || age > DATA_STALE_MS) ? "true" : "false",
              (unsigned)(n / LOG_RATE_HZ),
-             r.lap_ds / 10, r.lap_ds % 10, r.lap_cm / 100, r.lap_cm % 100, r.laps, lapj, signj);
+             r.lap_ds / 10, r.lap_ds % 10, r.lap_cm / 100, r.lap_cm % 100, r.laps, lapj, signj,
+             r.sig_mm / 1000, r.sig_mm % 1000, r.scale / 1000, r.scale % 1000);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -315,8 +419,8 @@ static esp_err_t data_handler(httpd_req_t *req)
 // GET /log.csv -> the last LOG_SECONDS of data as a file download
 static esp_err_t log_download_handler(httpd_req_t *req)
 {
-    // ~45 KB, so it lives in PSRAM (allocated on the first download) instead of internal RAM
-    static const size_t CSV_SIZE = sizeof(LOG_HEADER) + LOG_ROWS * 200;
+    // ~390 KB, so it lives in PSRAM (allocated on the first download) instead of internal RAM
+    static const size_t CSV_SIZE = sizeof(LOG_HEADER) + LOG_ROWS * 260; // rows with events are ~230 chars (~390 KB)
     static char *csv = NULL;
     if (!rows)
         return httpd_resp_send_500(req);
@@ -338,9 +442,10 @@ static esp_err_t log_download_handler(httpd_req_t *req)
         tenths_to_str(r.est, es, sizeof(es));
         mm_to_str(r.xe_mm, xes, sizeof(xes));
         mm_to_str(r.ye_mm, yes, sizeof(yes));
-        len += snprintf(csv + len, CSV_SIZE - len, "%u,%s,%s,%s,%s,%s,%s,%s,%u.%u,%u.%02u,%u,%s,",
+        len += snprintf(csv + len, CSV_SIZE - len, "%u,%s,%s,%s,%s,%s,%s,%s,%u.%u,%u.%02u,%u,%s,%u.%03u,%u.%03u,",
                         r.t, a, pr, xs, ys, es, xes, yes,
-                        r.lap_ds / 10, r.lap_ds % 10, r.lap_cm / 100, r.lap_cm % 100, r.laps, r.state);
+                        r.lap_ds / 10, r.lap_ds % 10, r.lap_cm / 100, r.lap_cm % 100, r.laps, r.state,
+                        r.sig_mm / 1000, r.sig_mm % 1000, r.scale / 1000, r.scale % 1000);
         if (len >= CSV_SIZE)
             break;
         if (r.sign) {
@@ -359,10 +464,50 @@ static esp_err_t log_download_handler(httpd_req_t *req)
         if (r.lap) {
             char d[16];
             mm_to_str(r.lap_mm, d, sizeof(d));
-            len += snprintf(csv + len, CSV_SIZE - len, "%u,%.1f,%s,%.3f\n", r.lap_n, r.lap_ms / 1000.0f, d,
+            len += snprintf(csv + len, CSV_SIZE - len, "%u,%.1f,%s,%.3f,", r.lap_n, r.lap_ms / 1000.0f, d,
                             r.lap_ms ? (float)r.lap_mm / (float)r.lap_ms : 0.0f);
         } else
-            len += strlcpy(csv + len, ",,,\n", CSV_SIZE - len);
+            len += strlcpy(csv + len, ",,,,", CSV_SIZE - len);
+        if (len >= CSV_SIZE)
+            break;
+        char m1[16], m2[16], m3[16], m4[16], m5[16], m6[16];
+        if (r.cf) {
+            mm_to_str(r.cf_x, m1, sizeof(m1));
+            mm_to_str(r.cf_y, m2, sizeof(m2));
+            mm_to_str(r.cf_dx, m3, sizeof(m3));
+            mm_to_str(r.cf_dy, m4, sizeof(m4));
+            len += snprintf(csv + len, CSV_SIZE - len, "%d,%s,%s,%s,%s,%d,", r.cf_leg, m1, m2, m3, m4, r.cf_used);
+        } else
+            len += strlcpy(csv + len, ",,,,,,", CSV_SIZE - len);
+        if (len >= CSV_SIZE)
+            break;
+        if (r.ob) {
+            mm_to_str(r.ob_x, m1, sizeof(m1));
+            mm_to_str(r.ob_y, m2, sizeof(m2));
+            mm_to_str(r.ob_dx, m3, sizeof(m3));
+            mm_to_str(r.ob_dy, m4, sizeof(m4));
+            len += snprintf(csv + len, CSV_SIZE - len, "%s,%s,%s,%s,%s,%d,", m1, m2, r.ob_side ? "right" : "left",
+                            m3, m4, r.ob_used);
+        } else
+            len += strlcpy(csv + len, ",,,,,,", CSV_SIZE - len);
+        if (len >= CSV_SIZE)
+            break;
+        if (r.ov)
+            len += snprintf(csv + len, CSV_SIZE - len, "%.2f,%d,", r.ov_ms / 1000.0f, r.ov_found);
+        else
+            len += strlcpy(csv + len, ",,", CSV_SIZE - len);
+        if (len >= CSV_SIZE)
+            break;
+        if (r.tl) {
+            mm_to_str(r.tl_cx, m1, sizeof(m1));
+            mm_to_str(r.tl_cy, m2, sizeof(m2));
+            mm_to_str(r.tl_x, m3, sizeof(m3));
+            mm_to_str(r.tl_y, m4, sizeof(m4));
+            mm_to_str(r.tl_dx, m5, sizeof(m5));
+            mm_to_str(r.tl_dy, m6, sizeof(m6));
+            len += snprintf(csv + len, CSV_SIZE - len, "%s,%s,%s,%s,%s,%s\n", m1, m2, m3, m4, m5, m6);
+        } else
+            len += strlcpy(csv + len, ",,,,,\n", CSV_SIZE - len);
     }
     xSemaphoreGive(log_mutex);
     if (len > CSV_SIZE - 1)

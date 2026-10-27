@@ -116,20 +116,23 @@ object_t obj_prev = {'N',0,0,0,0,'?',0,0,0};
 /*---------------- Red object / stop sign logic (from ESP32 camera) ----------------
   The ESP32 sends D1 = 'N' (not checked yet), 'S' (checked: stop sign), 'X' (checked: NOT a stop sign).
   Flow:
-    DRIVE      -> close red object seen                        -> RED_WAIT   (stop)
-    RED_WAIT   -> camera confirms stop sign ('S')              -> SIGN_HOLD  (start 3 s timer)
+    DRIVE      -> close red object seen                        -> RED_WAIT   (stop, model checks it)
+    RED_WAIT   -> camera confirms stop sign ('S')              -> TO_STOP_LINE
     RED_WAIT   -> camera says "not a stop sign" ('X') twice    -> RED_IGNORE (drive on)
     RED_WAIT   -> red no longer seen                           -> DRIVE
-    RED_IGNORE -> drive, ignoring this red; a stop sign ('S')  -> SIGN_HOLD
+    RED_IGNORE -> drive, ignoring this red; a stop sign ('S')  -> TO_STOP_LINE
     RED_IGNORE -> red no longer seen                           -> DRIVE
-    (stop sign confirmed: if it matches a sign in STOP_MAP the car first drives on to that
-     sign's stop line at the junction (TO_STOP_LINE), using the position estimate; otherwise
-     it holds right where it is)
+    Stop sign confirmed: the car drives on to the NEXT stop line on its route (Next_StopLine: the one
+    before the crossing on the section it is on, or that it is heading for), using the position
+    estimate, and holds there. Only if its position on the track is unknown does it hold where it is.
+    (Before, the stop line came from matching the sign through its rough camera range, so when that
+     match failed the car held wherever it was - the inconsistent stops at the intersection.)
     TO_STOP_LINE -> estimate reaches the stop line             -> SIGN_HOLD
     SIGN_HOLD  -> 3 s passed                                   -> COOLDOWN
     COOLDOWN   -> drive, ignore red for 5 s so we can pass the sign -> DRIVE
 */
-#define STOP_SIGN_DEBUG        1     // 1 = print state changes, 0 = off
+#define STOP_SIGN_DEBUG        0     // 1 = print state changes, 0 = off (off to save flash: the state is
+                                     // already in every telemetry row / the CSV state column)
 #define STOP_SIGN_HOLD_MS      3000  // how long to stop at a confirmed stop sign
 #define STOP_SIGN_COOLDOWN_MS  5000  // ignore red/stop signs this long after the hold, so the car can drive past
 #define RED_FRESH_MS           2000  // red counts as "still there" if seen within this time
@@ -169,9 +172,13 @@ static bool stop_sign_pending = false; // set when a "D1":"S" message arrives
 static uint8_t red_rejects = 0;        // "D1":"X" answers received while in RED_WAIT
 
 static int8_t Camera_SignFix(void);                  // camera fusion, defined after the kinematic model
+static void Light_Calibrate(void);                   // traffic light range constant, at the start
+static void Light_Fix(void);                         // logs the traffic light's estimated position once
 static bool StopLine_Reached(int8_t m);             // true once the estimate is at map sign m's stop line
-#define TO_STOP_LINE_TIMEOUT_MS 6000                // hold anyway if the stop line isn't reached by then
+#define TO_STOP_LINE_TIMEOUT_MS 15000               // hold anyway if the stop line isn't reached by then
+                                                    // (signs are seen up to ~2 m away, sometimes before a corner)
 static int8_t approach_sign = -1;                   // STOP_MAP entry being approached
+static int8_t Next_StopLine(void);                  // stop line the car is heading for (-1 = unknown)
 
 static void RedStop_SetState(RedStopState s)
 {
@@ -209,7 +216,8 @@ static bool RedTooClose(void)
 // drive on to the sign's stop line (sign on the map) or hold right here (unknown sign).
 static void RedStop_SignConfirmed(void)
 {
-  approach_sign = Camera_SignFix();
+  Camera_SignFix();                // position fix from the sign (and the log), when it matches
+  approach_sign = Next_StopLine(); // then: the crossing the car is heading for
   if (approach_sign >= 0 && !StopLine_Reached(approach_sign))
     RedStop_SetState(RS_TO_STOP_LINE);
   else
@@ -279,6 +287,7 @@ bool ApplicationFunctionSet::ApplicationFunctionSet_TrafficLight(void)
     light_state = LIGHT_RED;
     light_red_time = millis();
     Serial.print(F("{LIGHT RED - waiting for green}"));
+    Light_Calibrate(); // standing at the start: learn the light's blob size vs distance
   }
   else if (light_state == LIGHT_LOOK && millis() - light_look_start >= LIGHT_LOOK_MS)
   {
@@ -290,6 +299,7 @@ bool ApplicationFunctionSet::ApplicationFunctionSet_TrafficLight(void)
     light_state = LIGHT_GO;
     RedStop_SetState(RS_COOLDOWN); // don't stop for the red foam while pulling away
     Serial.print(F("{LIGHT GREEN - go}"));
+    Light_Calibrate();
   }
   if (light_state == LIGHT_GO)
     return false;
@@ -361,6 +371,8 @@ static bool RedStop_MustStop(void)
     break;
   }
 
+  // RED_WAIT stops at once (so there is time to check the red and still stop before the crossing);
+  // SIGN_HOLD is the 3 s at the stop line
   return red_state == RS_RED_WAIT || red_state == RS_SIGN_HOLD;
 }
 
@@ -475,7 +487,8 @@ static void ApplicationFunctionSet_SmartRobotCarLinearMotionControl(SmartRobotCa
 */
 void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed)
 {
-  ApplicationFunctionSet Application_FunctionSet;
+  // (FIX: a local "ApplicationFunctionSet Application_FunctionSet;" was here. It was never used, but it
+  //  built a whole copy of the object, String included, on every motor command.)
   static uint8_t directionRecord = 0;
   uint8_t Kp, UpperLimit;
   uint8_t speed = is_speed;
@@ -527,8 +540,9 @@ void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionContro
                                              /*direction_B*/ direction_just, /*speed_B*/ speed, /*controlED*/ control_enable); //Motor control
     }
     else
-    { //When moving forward, enter the direction and position approach control loop processing
-      ApplicationFunctionSet_SmartRobotCarLinearMotionControl(Forward, directionRecord, speed, Kp, UpperLimit);
+    { // (the Elegoo yaw-hold controller for the phone-app modes was removed to save flash:
+      //  the car is always in line-tracking mode, so it never ran)
+      AppMotor.DeviceDriverSet_Motor_control(direction_just, speed, direction_just, speed, control_enable);
       directionRecord = 1;
     }
 
@@ -541,8 +555,8 @@ void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionContro
                                              /*direction_B*/ direction_back, /*speed_B*/ speed, /*controlED*/ control_enable); //Motor control
     }
     else
-    { //When moving backward, enter the direction and position approach control loop processing
-      ApplicationFunctionSet_SmartRobotCarLinearMotionControl(Backward, directionRecord, speed, Kp, UpperLimit);
+    {
+      AppMotor.DeviceDriverSet_Motor_control(direction_back, speed, direction_back, speed, control_enable);
       directionRecord = 2;
     }
 
@@ -734,21 +748,141 @@ float Pose_X = 0;   // m
 float Pose_Y = 0;   // m
 float Pose_Psi = 0; // rad
 
-/*---------------- Gyro fusion ----------------
-  Estimated pose = the kinematic model, but its heading is continuously pulled toward the gyro
-  heading (complementary filter):
-      psi_est += w_model * dt                               (predict with the model)
-      psi_est += dt / (FUSION_T + dt) * (psi_gyro - psi_est) (correct with the gyro)
-  and the estimated X/Y are integrated with psi_est. The model alone over-counts the tracker's
-  short steering pulses (~+2 deg/s false left drift on straight line); the gyro was within ~3 deg
-  of the real track on the corners, so it gets most of the weight (short FUSION_T).
-  Hand-check on the 14:52 run: corners came out within ~0.1 m of the track instead of 0.5-0.7 m.*/
-#define FUSION_T   0.5f     // s: how fast the estimate follows the gyro. Smaller = trust gyro more.
+/*---------------- Position estimate: EKF (extended Kalman filter) ----------------
+  State: X, Y (m), heading psi (rad), and s = speed scale of the wheel model (how far the car really
+  goes per metre the PWM model predicts). s is learned from the landmark fixes, so the model adapts to
+  the floor's traction and the battery; it is kept between runs (only a power cycle resets it to 1).
+  Predict (every Kinematics_Update):  X += s*v*cos(psi)*dt,  Y += s*v*sin(psi)*dt,  psi += gyro step
+    v = wheel model speed from the PWM; the heading uses the gyro (accurate) instead of the model.
+    Process noise: wiggle/slip per metre driven, gyro drift per second and scale error per radian.
+  Update (Ekf_PosUpdate): a measurement of where the car's centre is, from a landmark on the map:
+    - track corners (exact): a line search at a corner that finds the next section (Corner_Fix)
+    - the obstacle (moose, centre of the bottom section): ultrasonic range when a pass starts
+    - the two stop signs at the crossing: camera range (blob size) + bearing when a sign is confirmed
+    (the traffic light's position is only logged, once per run - its fixes were unreliable)
+  Each update is gated (Mahalanobis distance), so a wrong match or a moved landmark can't throw the
+  estimate off. Est_* = the EKF estimate; Pose_* = the model alone (for the comparison in the report).
+  Every fix is logged with the estimate BEFORE the fix, so the report can show the raw estimate error.*/
+#define EKF_SIG_POS0  0.03f                 // m, start position uncertainty (car placed by hand)
+#define EKF_SIG_PSI0  (3.0f * PI / 180.0f)  // rad, start heading uncertainty
+#define EKF_SIG_S0    0.10f                 // speed scale starts at 1 +- 10 %
+#define EKF_Q_POS     0.0004f               // m^2 per m driven (2 cm per m: wiggle on the line, slip)
+#define EKF_Q_PSI_T   2.7e-5f               // rad^2 per s (gyro drift ~0.3 deg/s)
+#define EKF_Q_PSI_R   0.0009f               // rad^2 per rad turned (3 % gyro scale error)
+#define EKF_Q_S       4e-6f                 // per s: lets the speed scale drift slowly
+#define EKF_GATE      25.0f                 // reject a fix more than 5 sigma from the estimate
 
 float Heading_Gyro = 0; // deg, same sign convention as the model (+ = left), 0 at pose reset
 float Est_X = 0;        // m
 float Est_Y = 0;        // m
 float Est_Psi = 0;      // rad
+float Ekf_Scale = 1.0f; // speed scale s
+static float P[4][4];   // covariance of [X, Y, psi, s]
+// Loop count for the 4x4 loops. volatile so the compiler can't unroll them: unrolled, the EKF
+// doesn't fit in the UNO's flash (loops cost a few microseconds, which doesn't matter here).
+static volatile uint8_t EKF_N = 4;
+static float ekf_last_gyro = 0; // Heading_Gyro at the last predict step (deg)
+
+// New run: the pose is known (start), the learned speed scale is kept
+static void Ekf_ResetPose(void)
+{
+  float pss = P[3][3] > 0 ? P[3][3] : EKF_SIG_S0 * EKF_SIG_S0;
+  memset(P, 0, sizeof(P));
+  P[0][0] = P[1][1] = EKF_SIG_POS0 * EKF_SIG_POS0;
+  P[2][2] = EKF_SIG_PSI0 * EKF_SIG_PSI0;
+  P[3][3] = pss;
+}
+
+// v = model speed (m/s) over dt (s); the heading step comes from the gyro
+static void Ekf_Predict(float v, float dt)
+{
+  float dpsi = (Heading_Gyro - ekf_last_gyro) * (PI / 180.0f);
+  ekf_last_gyro = Heading_Gyro;
+  float ds = v * dt; // distance by the model
+  float c = cos(Est_Psi + 0.5f * dpsi), sn = sin(Est_Psi + 0.5f * dpsi);
+  Est_X += Ekf_Scale * ds * c;
+  Est_Y += Ekf_Scale * ds * sn;
+  Est_Psi += dpsi;
+
+  // P = F P F^T + Q with F = I + G; G only has G[0][2], G[0][3], G[1][2], G[1][3]
+  if (ds != 0)
+  {
+    float a = -Ekf_Scale * ds * sn, b = ds * c, e = Ekf_Scale * ds * c, f = ds * sn;
+    float g0[4], g1[4]; // rows 0 and 1 of G P
+    for (uint8_t j = 0; j < EKF_N; j++)
+    {
+      g0[j] = a * P[2][j] + b * P[3][j];
+      g1[j] = e * P[2][j] + f * P[3][j];
+    }
+    float q00 = g0[2] * a + g0[3] * b, q01 = g0[2] * e + g0[3] * f, q11 = g1[2] * e + g1[3] * f; // G P G^T
+    for (uint8_t j = 0; j < EKF_N; j++)
+    {
+      P[0][j] += g0[j]; // + G P
+      P[1][j] += g1[j];
+    }
+    for (uint8_t i = 0; i < EKF_N; i++)
+    {
+      P[i][0] += g0[i]; // + P G^T = (G P)^T
+      P[i][1] += g1[i];
+    }
+    P[0][0] += q00;
+    P[0][1] += q01;
+    P[1][0] += q01;
+    P[1][1] += q11;
+  }
+  float dist = fabs(ds * Ekf_Scale);
+  P[0][0] += EKF_Q_POS * dist;
+  P[1][1] += EKF_Q_POS * dist;
+  P[2][2] += EKF_Q_PSI_T * dt + EKF_Q_PSI_R * fabs(dpsi);
+  P[3][3] += EKF_Q_S * dt;
+}
+
+/* Fix: the car's centre was measured at (zx, zy), with standard deviation sa along the unit vector
+   (ux, uy) and sc across it. Returns false if it failed the gate (not used). *dx, *dy = how far the
+   estimate moved. All the state (heading and speed scale too) is corrected through the covariance.*/
+bool Ekf_PosUpdate(float zx, float zy, float ux, float uy, float sa, float sc, float *dx, float *dy)
+{
+  *dx = *dy = 0;
+  float r00 = sa * sa * ux * ux + sc * sc * uy * uy; // R = sa^2 u u^T + sc^2 n n^T
+  float r01 = (sa * sa - sc * sc) * ux * uy;
+  float r11 = sa * sa * uy * uy + sc * sc * ux * ux;
+  float s00 = P[0][0] + r00, s01 = P[0][1] + r01, s11 = P[1][1] + r11; // S = H P H^T + R
+  float det = s00 * s11 - s01 * s01;
+  if (det <= 1e-12f)
+    return false;
+  float i00 = s11 / det, i01 = -s01 / det, i11 = s00 / det; // S^-1
+  float ex = zx - Est_X, ey = zy - Est_Y;                   // innovation
+  if (ex * (i00 * ex + i01 * ey) + ey * (i01 * ex + i11 * ey) > EKF_GATE)
+    return false;
+  float k[4][2]; // K = P H^T S^-1
+  for (uint8_t i = 0; i < EKF_N; i++)
+  {
+    k[i][0] = P[i][0] * i00 + P[i][1] * i01;
+    k[i][1] = P[i][0] * i01 + P[i][1] * i11;
+  }
+  *dx = k[0][0] * ex + k[0][1] * ey;
+  *dy = k[1][0] * ex + k[1][1] * ey;
+  Est_X += *dx;
+  Est_Y += *dy;
+  Est_Psi += k[2][0] * ex + k[2][1] * ey;
+  Ekf_Scale = constrain(Ekf_Scale + k[3][0] * ex + k[3][1] * ey, 0.7f, 1.3f);
+  float p0[4], p1[4]; // P = P - K H P
+  memcpy(p0, P[0], sizeof(p0));
+  memcpy(p1, P[1], sizeof(p1));
+  for (uint8_t i = 0; i < EKF_N; i++)
+    for (uint8_t j = 0; j < EKF_N; j++)
+      P[i][j] -= k[i][0] * p0[j] + k[i][1] * p1[j];
+  for (uint8_t i = 0; i < EKF_N; i++) // keep it symmetric
+    for (uint8_t j = i + 1; j < EKF_N; j++)
+      P[i][j] = P[j][i] = 0.5f * (P[i][j] + P[j][i]);
+  return true;
+}
+
+static void Print_mm(float m)
+{
+  Serial.print(',');
+  Serial.print((long)(m * 1000));
+}
 
 /*---------------- Lap time / distance ----------------
   The lap timer starts the first time the motors turn after a pose reset (so press Reset position
@@ -799,6 +933,8 @@ void Kinematics_Reset(void)
   Est_Psi = START_PSI_DEG * (PI / 180.0f);
   AppMPU6050getdata.agz = 0; // gyro heading starts at START_PSI_DEG together with the model
   Heading_Gyro = START_PSI_DEG;
+  ekf_last_gyro = START_PSI_DEG;
+  Ekf_ResetPose();
   lap_running = false; // lap timer starts when the car next moves
   Lap_Dist = 0;
   Lap_Count = 0;
@@ -832,12 +968,8 @@ void Kinematics_Update(void)
   Pose_Y += v * sin(psi_mid) * dt;
   Pose_Psi += w * dt;
 
-  // Fused estimate: same motion, heading corrected toward the gyro
-  float est_mid = Est_Psi + 0.5f * w * dt;
-  Est_X += v * cos(est_mid) * dt;
-  Est_Y += v * sin(est_mid) * dt;
-  Est_Psi += w * dt;
-  Est_Psi += (dt / (FUSION_T + dt)) * (Heading_Gyro * (PI / 180.0f) - Est_Psi);
+  // EKF estimate: model speed (times the learned scale) with the gyro heading
+  Ekf_Predict(v, dt);
 
   Heading_Predicted = Pose_Psi * (180.0f / PI);
 
@@ -875,127 +1007,164 @@ void Kinematics_Update(void)
   }
 }
 
-/*---------------- Camera fusion: stop signs as position landmarks ----------------
-  The car stops for a stop sign when the sign's red blob reaches a fixed size in the camera
-  image (RED_STOP_MIN_PX), so it always stops the same distance from the sign. Each sign
-  therefore marks a known stopping point on the track (STOP_MAP). When the car stops at a
-  confirmed stop sign:
-    1. find the map point closest to the fused estimate, with a similar heading (gate)
-    2. pull the estimate toward it:  est += CAM_GAIN * (map - est)
-       The gyro fixes heading but not distance; this fixes the distance (along-track) error.
-    3. estimate where the sign itself is: range from the blob size (pinhole camera: blob
-       pixels ~ 1/range^2) and bearing from the blob's x position in the image
-  and send {SG,stop_x,stop_y,sign_x,sign_y,fix_dx,fix_dy,match} (mm) to the logger.
-  stop_x/stop_y is the estimate BEFORE the fix: after a run, put the averages for each sign
-  into STOP_MAP (or measure the stopping points on the track with a tape).*/
-#define CAM_FUSION    1      // 0 = only log the signs, don't correct the position
-#define CAM_GAIN      0.7f   // 0..1: how much to trust the map point over the estimate
-#define CAM_GATE_M    0.5f   // ignore map points farther than this from the estimate
-#define CAM_GATE_DEG  45     // ... or with a heading more than this different
+/*---------------- Camera landmarks: stop signs and the traffic light ----------------
+  Range from the blob size (pinhole camera: blob pixels ~ 1/range^2, range = K / sqrt(px)) and bearing
+  from the blob's x position give where the landmark is relative to the car, so with the landmark's
+  position on the map the car's position is known: car = landmark - range * (cos, sin)(psi + bearing).
+  The range is only rough (blob size depends on glare, angle...), so the fix is trusted much less
+  along the line of sight than across it.
+  Logged with the estimate BEFORE the fix:
+    {SG,car_x,car_y,sign_x,sign_y,fix_dx,fix_dy,match}  stop sign confirmed (mm; match -1 = no fix)
+    {TL,car_x,car_y,light_x,light_y,fix_dx,fix_dy}      traffic light seen on the 1.7 m section, before it*/
 #define CAM_HFOV_DEG  60.0f  // camera horizontal field of view (deg); adjust for a wide lens
 #define CAM_IMG_W     160    // QQVGA image width (pixels), D2 = blob centre x in this image
-#define CAM_RANGE_K   18.0f  // m*sqrt(px): range = K / sqrt(blob px)  (pinhole: px ~ 1/range^2)
-                             // Was 4.14 from the ESP32's dist_class table (275 px = 0.25 m), which put
-                             // the real sign 0.21 m away when it was ~0.92 m away (16:4x run), so
-                             // K = 4.14 * 0.92 / 0.21 = 18. Measure once with a tape to refine.
+#define CAM_RANGE_K   5.5f   // stop sign: m*sqrt(px), range = K / sqrt(blob px). Was 18, which put the signs
+                             // ~3x too far away (robot_log_8: 4 sightings vs the measured sign positions
+                             // gave K = 4.9 / 5.5 / 6.5 / 5.1). Re-measure: sign at a known distance d,
+                             // read its pixel count N on the ESP32 serial, K = d * sqrt(N)
+#define CAM_RANGE_SIG 0.25f  // range error, fraction of the range
+#define CAM_GATE_DEG  45     // a sign only matches if the car's heading is within this of its approach
+#define SIGN_MATCH_M  1.0f   // ... and the sign estimate is within this of it
 
-struct StopPoint
+// The two stop signs, just before the crossing (1.50, 0), off to the side of the tape.
+// MEASURE: how far before the crossing centre (along the tape) and how far to the side of it.
+#define SIGN_A_BEFORE_M 0.15f // sign facing the 1.2 m section (car approaching at 120 deg)
+#define SIGN_A_SIDE_M   0.15f //   on the side toward the 1.5 m section
+#define SIGN_B_BEFORE_M 0.15f // sign facing the 1.5 m section (car approaching at 0 deg)
+#define SIGN_B_SIDE_M   0.15f //   on the side toward the 1.2 m section
+#define STOP_LINE_GAP_M 0.35f // the car holds with its centre this far before the crossing centre
+                              // (was 0.20: stopped a little too close to the intersection)
+
+struct StopSign
 {
-  float x, y;           // m, where the camera confirms the sign (car stops in RED_WAIT here)
-  int16_t psi;          // deg, car heading there (wrapped to -180..180)
-  float line_x, line_y; // m, the stop line at the junction, where the car holds for 3 s
+  float x, y;           // m, the sign
+  int16_t psi;          // deg, heading of a car approaching it
+  float line_x, line_y; // m, where the car holds for 3 s (before the crossing)
 };
-// Real stop sign at the crossing (1.50, 0), facing the 1.2 m section of the long return leg.
-// Detection point from the 16:4x run: the camera confirmed it at (1.99, -0.80), heading 140 deg
-// (the previous run gave ~(1.94, -0.80)). Check it with a tape: car centre ~0.92 m before the
-// crossing, ~0.3 m past the top-right corner.
-// Stop line: STOP_LINE_GAP_M before the crossing along that leg (direction 120 deg):
-//   (1.50, 0) - 0.20 * (cos 120, sin 120) = (1.60, -0.17)
-#define STOP_LINE_GAP_M 0.20f // car centre this far before the crossing centre
-static const StopPoint STOP_MAP[] = {
-    {1.99f, -0.80f, 140, 1.50f + 0.5f * STOP_LINE_GAP_M, -0.866f * STOP_LINE_GAP_M},
+static const StopSign STOP_MAP[] = {
+    // 1.2 m section: direction 120 deg = (-0.5, 0.866); the side toward the 1.5 m section = (-0.866, -0.5)
+    {1.50f + 0.5f * SIGN_A_BEFORE_M - 0.866f * SIGN_A_SIDE_M, -0.866f * SIGN_A_BEFORE_M - 0.5f * SIGN_A_SIDE_M,
+     120, 1.50f + 0.5f * STOP_LINE_GAP_M, -0.866f * STOP_LINE_GAP_M},
+    // 1.5 m section (the start of the long diagonal): direction 0 deg; the side toward the 1.2 m section = -Y
+    {1.50f - SIGN_B_BEFORE_M, -SIGN_B_SIDE_M, 0, 1.50f - STOP_LINE_GAP_M, 0.0f},
 };
 #define STOP_MAP_N (sizeof(STOP_MAP) / sizeof(STOP_MAP[0]))
 
-// Distance still to drive to the stop line, measured along the approach direction
-// (detection point -> stop line). <= 0 once the estimate reaches or passes it.
+// Traffic light: just in front of the start, to the left of the tape (START_X_M, START_Y_M, facing
+// the top-left corner). It used to stand straight past the top-left corner, but from the start it was
+// too far away to see the red, and on lap 3 the car took it for an obstacle at that corner.
+// MEASURE both from the car's centre at the start: make sure it is in view on /stream from the start.
+#define LIGHT_AHEAD_M  0.40f // how far in front of the start position
+#define LIGHT_LEFT_M   0.20f // how far to the left of the tape
+#define LIGHT_X        (START_X_M + LIGHT_AHEAD_M)
+#define LIGHT_Y        (START_Y_M + LIGHT_LEFT_M)
+static float light_k = 0; // m*sqrt(px) for the light's blobs, measured at the start (Light_Calibrate)
+
+static float wrap180f(float deg)
+{
+  deg = fmod(deg, 360.0f);
+  if (deg > 180)
+    deg -= 360;
+  if (deg < -180)
+    deg += 360;
+  return deg;
+}
+
+// Bearing of the latest blob (rad, + = left)
+static float Blob_Bearing(void)
+{
+  return ((CAM_IMG_W / 2.0f) - obj_now.cent_x) * (CAM_HFOV_DEG * PI / 180.0f / CAM_IMG_W);
+}
+
+// Car-position fix from a landmark at (lx, ly) seen at range r and bearing b. Prints the pre-fix
+// car estimate, the landmark estimate from it, and the fix.
+static bool Landmark_Fix(float lx, float ly, float r, float b, bool use, float *dx, float *dy)
+{
+  float ux = cos(Est_Psi + b), uy = sin(Est_Psi + b); // line of sight
+  Print_mm(Est_X);
+  Print_mm(Est_Y);
+  Print_mm(Est_X + r * ux); // landmark position estimated from the car (before the fix)
+  Print_mm(Est_Y + r * uy);
+  bool ok = use && !Overtaking &&
+            Ekf_PosUpdate(lx - r * ux, ly - r * uy, ux, uy, CAM_RANGE_SIG * r + 0.05f, 0.05f * r + 0.03f, dx, dy);
+  Print_mm(*dx);
+  Print_mm(*dy);
+  return ok;
+}
+
+// The car stops at the stop line: distance still to drive along the approach direction <= 2 cm
 static bool StopLine_Reached(int8_t m)
 {
   if (m < 0 || m >= (int8_t)STOP_MAP_N)
     return true;
-  float ux = STOP_MAP[m].line_x - STOP_MAP[m].x;
-  float uy = STOP_MAP[m].line_y - STOP_MAP[m].y;
-  float len = hypot(ux, uy);
-  if (len < 0.01f)
-    return true;
-  float remaining = ((STOP_MAP[m].line_x - Est_X) * ux + (STOP_MAP[m].line_y - Est_Y) * uy) / len;
-  return remaining <= 0.02f;
+  float a = STOP_MAP[m].psi * (PI / 180.0f);
+  return (STOP_MAP[m].line_x - Est_X) * cos(a) + (STOP_MAP[m].line_y - Est_Y) * sin(a) <= 0.02f;
 }
 
+// Stop sign confirmed: which mapped sign is it, and fix the position with it. Returns the sign (-1 = none).
 static int8_t Camera_SignFix(void)
 {
-  float x0 = Est_X, y0 = Est_Y; // estimate before the fix
-  float dx = 0, dy = 0;
+  float range = 0.9f, bearing = 0;
+  if (obj_now.colour == 'R' && obj_now.sizePX > 0)
+  {
+    range = constrain(CAM_RANGE_K / sqrt((float)obj_now.sizePX), 0.1f, 3.0f);
+    bearing = Blob_Bearing();
+  }
+  float sx = Est_X + range * cos(Est_Psi + bearing), sy = Est_Y + range * sin(Est_Psi + bearing);
   int8_t match = -1;
-#if CAM_FUSION
-  float psi_deg = Est_Psi * (180.0f / PI);
-  float best = CAM_GATE_M;
+  float best = SIGN_MATCH_M;
   for (uint8_t i = 0; i < STOP_MAP_N; i++)
   {
-    float dpsi = psi_deg - STOP_MAP[i].psi;
-    while (dpsi > 180)
-      dpsi -= 360;
-    while (dpsi < -180)
-      dpsi += 360;
-    if (fabs(dpsi) > CAM_GATE_DEG)
+    if (fabs(wrap180f(Est_Psi * (180.0f / PI) - STOP_MAP[i].psi)) > CAM_GATE_DEG)
       continue;
-    float d = hypot(STOP_MAP[i].x - x0, STOP_MAP[i].y - y0);
+    float d = hypot(STOP_MAP[i].x - sx, STOP_MAP[i].y - sy);
     if (d < best)
     {
       best = d;
       match = i;
     }
   }
-  if (match >= 0)
-  {
-    dx = CAM_GAIN * (STOP_MAP[match].x - x0);
-    dy = CAM_GAIN * (STOP_MAP[match].y - y0);
-    Est_X += dx;
-    Est_Y += dy;
-  }
-#endif
-  // Where is the sign? Range and bearing from the latest red blob (default 0.4 m straight ahead)
-  float range = 0.9f, bearing = 0;
-  if (obj_now.colour == 'R' && obj_now.sizePX > 0)
-  {
-    range = CAM_RANGE_K / sqrt((float)obj_now.sizePX);
-    range = constrain(range, 0.1f, 2.5f);
-    // image x grows to the right, bearing is + to the left
-    bearing = ((CAM_IMG_W / 2.0f) - obj_now.cent_x) * (CAM_HFOV_DEG * PI / 180.0f / CAM_IMG_W);
-  }
-  float sx = Est_X + range * cos(Est_Psi + bearing);
-  float sy = Est_Y + range * sin(Est_Psi + bearing);
-
-  Serial.print(F("{SG,"));
-  Serial.print((long)(x0 * 1000));
+  float dx, dy;
+  Serial.print(F("{SG"));
+  bool ok = Landmark_Fix(match >= 0 ? STOP_MAP[match].x : 0, match >= 0 ? STOP_MAP[match].y : 0,
+                         range, bearing, match >= 0, &dx, &dy);
   Serial.print(',');
-  Serial.print((long)(y0 * 1000));
-  Serial.print(',');
-  Serial.print((long)(sx * 1000));
-  Serial.print(',');
-  Serial.print((long)(sy * 1000));
-  Serial.print(',');
-  Serial.print((long)(dx * 1000));
-  Serial.print(',');
-  Serial.print((long)(dy * 1000));
-  Serial.print(',');
-  Serial.print(match);
+  Serial.print(ok ? match : -1);
   Serial.print('}');
-  return match;
+  return match; // the stop line is used even if the position fix failed the gate
+}
+
+// At the start (car standing at the known start pose): the light's blob size there gives its range
+// constant, so later sightings give a range. Called when the light is identified / turns green.
+static bool light_logged = false; // the light's position has been logged this run
+
+static void Light_Calibrate(void)
+{
+  if (obj_now.sizePX == 0)
+    return;
+  light_k = hypot(LIGHT_X - Est_X, LIGHT_Y - Est_Y) * sqrt((float)obj_now.sizePX);
+  light_logged = false; // new run: log the light again once
+}
+
+// The first red/green blob on the 1.7 m section after the start (heading for the top-left corner) =
+// the traffic light: log where the car estimates it is, ONCE per run ({TL,...}). It is not used to
+// correct the position: in robot_log_8 two of those fixes pulled the estimate 0.19 m and 0.38 m
+// sideways while the car was on the tape (the corners and the moose correct it reliably).
+static void Light_Fix(void)
+{
+  if (light_logged || light_k <= 0 || light_state != LIGHT_GO || Overtaking || obj_now.type == 'S' ||
+      (obj_now.colour != 'R' && obj_now.colour != 'G') || obj_now.sizePX < LIGHT_MIN_PX ||
+      fabs(wrap180f(Est_Psi * (180.0f / PI))) > 25 || Est_X < 1.6f || Est_X > LIGHT_X - 0.25f)
+    return;
+  light_logged = true;
+  float range = constrain(light_k / sqrt((float)obj_now.sizePX), 0.1f, 3.0f), dx, dy;
+  Serial.print(F("{TL"));
+  Landmark_Fix(LIGHT_X, LIGHT_Y, range, Blob_Bearing(), false, &dx, &dy); // log only, no fix
+  Serial.print('}');
 }
 
 /*Telemetry for the ESP32 data logger, 5x per second:
-    {T,time_ms,heading_gyro,heading_pred,x_pred,y_pred,heading_est,x_est,y_est,lap_ds,lap_cm,laps,state}
+    {T,time_ms,heading_gyro,heading_pred,x_pred,y_pred,heading_est,x_est,y_est,lap_ds,lap_cm,laps,sig_mm,scale,state}
   lap_ds: current lap time in tenths of a second, lap_cm: current lap distance in cm,
   laps: laps completed. Events: {SG,...} stop sign (Camera_SignFix), {LP,...} lap done.
   Headings in tenths of a degree, positions in millimetres (integers, to avoid the float print code).
@@ -1080,6 +1249,9 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Telemetry(bool estop_active)
   Serial.print((long)(Lap_Dist * 100)); // lap distance, cm
   Serial.print(',');
   Serial.print(Lap_Count);
+  Print_mm(sqrt(P[0][0] + P[1][1])); // EKF position uncertainty (1 sigma), mm
+  Serial.print(',');
+  Serial.print((long)(Ekf_Scale * 1000)); // learned speed scale x 1000
   Serial.print(',');
   Serial.print(state);
   Serial.print('}');
@@ -1113,142 +1285,22 @@ static void CMD_Lighting(uint8_t is_LightingSequence, int8_t is_LightingColorVal
 }
 
 /*RBG_LED set*/
+/*Status LED. The car is always in line-tracking mode, so Elegoo's per-mode colours came down to:
+  green, or (battery low) a red blink pattern for 0.5 s every 3 s. Rewritten to just that, and the LED
+  is only re-sent when its colour changes (the old code cleared and re-sent it on every loop, and the
+  per-mode code took ~0.6 KB of flash that the position estimate needs).*/
 void ApplicationFunctionSet::ApplicationFunctionSet_RGB(void)
 {
-  static unsigned long getAnalogue_time = 0;
-  FastLED.clear(true);
-  if (true == VoltageDetectionStatus) //Act on low power state？
-  {
-    if ((millis() - getAnalogue_time) > 3000)
-    {
-      getAnalogue_time = millis();
-    }
-  }
-  unsigned long temp = millis() - getAnalogue_time;
-  if (function_xxx((temp), 0, 500) && VoltageDetectionStatus == true)
-  {
-    switch (temp)
-    {
-    case /* constant-expression */ 0 ... 49:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    case /* constant-expression */ 50 ... 99:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Black);
-      break;
-    case /* constant-expression */ 100 ... 149:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    case /* constant-expression */ 150 ... 199:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Black);
-      break;
-    case /* constant-expression */ 200 ... 249:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    case /* constant-expression */ 250 ... 299:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    case /* constant-expression */ 300 ... 349:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Black);
-      break;
-    case /* constant-expression */ 350 ... 399:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    case /* constant-expression */ 400 ... 449:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Black);
-      break;
-    case /* constant-expression */ 450 ... 499:
-      /* code */
-      AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-      break;
-    default:
-      break;
-    }
-  }
-  else if (((function_xxx((temp), 500, 3000)) && VoltageDetectionStatus == true) || VoltageDetectionStatus == false)
-  {
-    switch (Application_SmartRobotCarxxx0.Functional_Mode) //Act on mode control sequence
-    {
-    case /* constant-expression */ Standby_mode:
-      /* code */
-      {
-        if (VoltageDetectionStatus == true)
-        {
-          AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Red);
-          delay(30);
-          AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Black);
-          delay(30);
-        }
-        else
-        {
-          static uint8_t setBrightness = 0;
-          static boolean et = false;
-          static unsigned long time = 0;
-
-          if ((millis() - time) > 10)
-          {
-            time = millis();
-            if (et == false)
-            {
-              setBrightness += 1;
-              if (setBrightness == 100)
-                et = true;
-            }
-            else if (et == true)
-            {
-              setBrightness -= 1;
-              if (setBrightness == 0)
-                et = false;
-            }
-          }
-          // AppRBG_LED.leds[1] = CRGB::Blue;
-          AppRBG_LED.leds[0] = CRGB::Violet;
-          FastLED.setBrightness(setBrightness);
-          FastLED.show();
-        }
-      }
-      break;
-    case /* constant-expression */ CMD_Programming_mode:
-      /* code */
-      {
-      }
-      break;
-    case /* constant-expression */ TraceBased_mode:
-      /* code */
-      {
-        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Green);
-      }
-      break;
-    case /* constant-expression */ ObstacleAvoidance_mode:
-      /* code */
-      {
-        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Yellow);
-      }
-      break;
-    case /* constant-expression */ Follow_mode:
-      /* code */
-      {
-        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Blue);
-      }
-      break;
-    case /* constant-expression */ Rocker_mode:
-      /* code */
-      {
-        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, 2 /*Traversal_Number*/, CRGB::Violet);
-      }
-      break;
-    default:
-      break;
-    }
-  }
+  static unsigned long blink_start = 0;
+  static uint8_t shown = 255; // 0 = off, 1 = red, 2 = green
+  if (VoltageDetectionStatus && millis() - blink_start > 3000)
+    blink_start = millis();
+  unsigned long t = millis() - blink_start;
+  uint8_t c = (VoltageDetectionStatus && t < 500) ? (((t / 50) & 1) ? 0 : 1) : 2;
+  if (c == shown)
+    return;
+  shown = c;
+  AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0, NUM_LEDS, c == 2 ? CRGB(CRGB::Green) : (c == 1 ? CRGB(CRGB::Red) : CRGB(CRGB::Black)));
 }
 
 /*Rocker control mode*/
@@ -1304,20 +1356,51 @@ static const TrackLeg TRACK_LEGS[] = {
 };
 #define TRACK_LEGS_N (sizeof(TRACK_LEGS) / sizeof(TRACK_LEGS[0]))
 
-// Distance from the position estimate to a leg (m)
-static float Leg_Dist(const TrackLeg &g)
+// Distance from a point to a leg (m)
+static float Seg_Dist(const TrackLeg &g, float x, float y)
 {
   float dx = g.x1 - g.x0, dy = g.y1 - g.y0;
-  float t = ((Est_X - g.x0) * dx + (Est_Y - g.y0) * dy) / (dx * dx + dy * dy);
+  float t = ((x - g.x0) * dx + (y - g.y0) * dy) / (dx * dx + dy * dy);
   t = constrain(t, 0.0f, 1.0f);
-  return hypot(Est_X - (g.x0 + t * dx), Est_Y - (g.y0 + t * dy));
+  return hypot(x - (g.x0 + t * dx), y - (g.y0 + t * dy));
+}
+
+// The leg the car is on: heading within gate_deg of the leg's direction, and the closest one to the
+// position estimate within gate_m. -1 = none.
+static int8_t Match_Leg(float gate_deg, float gate_m)
+{
+  float psi_deg = Est_Psi * (180.0f / PI);
+  int8_t leg = -1;
+  for (uint8_t i = 0; i < TRACK_LEGS_N; i++)
+  {
+    float dpsi = fmod(psi_deg - TRACK_LEGS[i].psi, 360.0f); // wrap to -180..180
+    if (dpsi > 180)
+      dpsi -= 360;
+    if (dpsi < -180)
+      dpsi += 360;
+    if (fabs(dpsi) > gate_deg)
+      continue;
+    float d = Seg_Dist(TRACK_LEGS[i], Est_X, Est_Y);
+    if (d < gate_m)
+    {
+      gate_m = d;
+      leg = i;
+    }
+  }
+  return leg;
 }
 
 static int8_t line_last_side = -1;         // +1 = LEFT sensor saw the line last, -1 = RIGHT
 static unsigned long line_last_side_ms = 0; // when
 
+static int8_t search_leg = -1;       // leg matched when the current search started (-1 = none)
+static float search_x0, search_y0;   // estimate when it started
+
 static int8_t Search_FirstSide(void)
 {
+  search_leg = -1;
+  search_x0 = Est_X;
+  search_y0 = Est_Y;
   // Just after an overtake the line is beside the car, not at a corner: use the side bug_pass() left
   if ((long)(Search_Hint_Until - millis()) > 0)
   {
@@ -1326,26 +1409,9 @@ static int8_t Search_FirstSide(void)
     Serial.print(F(",pass}"));
     return Search_Hint_Side;
   }
-  float psi_deg = Est_Psi * (180.0f / PI);
-  float best = LEG_GATE_M;
-  int8_t side = 0, leg = -1;
-  for (uint8_t i = 0; i < TRACK_LEGS_N; i++)
-  {
-    float dpsi = fmod(psi_deg - TRACK_LEGS[i].psi, 360.0f); // wrap to -180..180
-    if (dpsi > 180)
-      dpsi -= 360;
-    if (dpsi < -180)
-      dpsi += 360;
-    if (fabs(dpsi) > LEG_GATE_DEG)
-      continue;
-    float d = Leg_Dist(TRACK_LEGS[i]);
-    if (d < best)
-    {
-      best = d;
-      side = TRACK_LEGS[i].next_dir;
-      leg = i;
-    }
-  }
+  int8_t leg = Match_Leg(LEG_GATE_DEG, LEG_GATE_M);
+  int8_t side = leg >= 0 ? TRACK_LEGS[leg].next_dir : 0;
+  search_leg = leg;
   if (side == 0)
   {
     if (millis() - line_last_side_ms < LAST_SIDE_FRESH_MS)
@@ -1360,6 +1426,98 @@ static int8_t Search_FirstSide(void)
   Serial.print(leg);
   Serial.print('}');
   return side;
+}
+
+/* Corner fix: a line search that started at the end of a mapped leg found the next leg on its first
+   sweep (in the direction the map predicted), so the car is at that corner. It lost the line when
+   the sensors passed the corner, so its centre was SENSOR_AHEAD_M before the corner on the leg it
+   came along; it has only spun on the spot since (plus a little tracking, added back on).
+   Logged: {CF,leg,car_x,car_y,fix_dx,fix_dy,used} (mm; car = estimate before the fix)*/
+#define CORNER_SIG_M  0.03f // corners are exact; this covers where exactly the sensors lose the tape
+#define CORNER_NEAR_M 0.50f // only if the estimate is this close to the corner (not a mid-leg wobble)
+
+static void Corner_Fix(int8_t leg)
+{
+  const TrackLeg &g = TRACK_LEGS[leg];
+  float L = hypot(g.x1 - g.x0, g.y1 - g.y0);
+  float ux = (g.x1 - g.x0) / L, uy = (g.y1 - g.y0) / L;
+  float zx = g.x1 - SENSOR_AHEAD_M * ux + (Est_X - search_x0); // + motion since the search started
+  float zy = g.y1 - SENSOR_AHEAD_M * uy + (Est_Y - search_y0);
+  float dx = 0, dy = 0;
+  bool ok = hypot(zx - Est_X, zy - Est_Y) < CORNER_NEAR_M &&
+            Ekf_PosUpdate(zx, zy, ux, uy, CORNER_SIG_M, CORNER_SIG_M, &dx, &dy);
+  Serial.print(F("{CF,"));
+  Serial.print(leg);
+  Print_mm(Est_X - dx);
+  Print_mm(Est_Y - dy);
+  Print_mm(dx);
+  Print_mm(dy);
+  Serial.print(',');
+  Serial.print(ok ? 1 : 0);
+  Serial.print('}');
+}
+
+/* The stop line the car is heading for, from where it is on the track (route order):
+     long diagonal before (or just past) the crossing           -> sign B's line (on that diagonal)
+     long diagonal after it, top section, or 1.2 m section before the crossing -> sign A's line
+     after the crossing on the 1 m section, the 90 deg section, the bottom section -> sign B's line
+   "Just past" = up to STOP_PAST_M beyond the crossing, so a slightly late estimate still holds there.*/
+#define STOP_PAST_M 0.30f
+static int8_t Next_StopLine(void)
+{
+  int8_t leg = Match_Leg(LEG_GATE_DEG, LEG_GATE_M);
+  if (leg < 0)
+    return -1;
+  if (leg == 0) // long diagonal from (0, 0) along +X, crossing at X = 1.50
+    return Est_X < 1.50f + STOP_PAST_M ? 1 : 0;
+  if (leg == 2) // from (2.10, -1.04) in direction 120 deg = (-0.5, 0.866), crossing 1.20 m along
+    return (-0.5f * (Est_X - 2.10f) + 0.866f * (Est_Y + 1.04f)) < 1.20f + STOP_PAST_M ? 0 : 1;
+  return leg == 1 ? 0 : 1;
+}
+
+// EKF position uncertainty (m, 1 sigma)
+float Ekf_PosSigma(void)
+{
+  return sqrt(P[0][0] + P[1][1]);
+}
+
+// Distance (m) from a point to the nearest track section (used to ignore things off the track)
+float Track_Dist(float x, float y)
+{
+  float best = 1e9f;
+  for (uint8_t i = 0; i < TRACK_LEGS_N; i++)
+    best = min(best, Seg_Dist(TRACK_LEGS[i], x, y));
+  return best;
+}
+
+// Direction of the track section the car is on, in GYRO heading degrees (the frame turn_to_heading
+// uses): the map direction moved into the gyro's frame with the EKF heading. Returns false if no
+// section matches (heading within 30 deg and estimate within 0.3 m).
+bool Track_LineHeading(float *gyro_deg)
+{
+  int8_t leg = Match_Leg(30, 0.3f);
+  if (leg < 0)
+    return false;
+  const TrackLeg &g = TRACK_LEGS[leg];
+  float leg_deg = atan2(g.y1 - g.y0, g.x1 - g.x0) * (180.0f / PI);
+  *gyro_deg = Heading_Gyro + wrap180f(leg_deg - Est_Psi * (180.0f / PI));
+  return true;
+}
+
+// Obstacle fix (called by bug_pass): the moose sits in the centre of the bottom section (leg 4), and
+// the ultrasonic measured range_m to its near face. Returns false if this isn't the moose (heading or
+// gate), e.g. another robot somewhere else.
+bool Obstacle_Fix(float range_m, float *dx, float *dy)
+{
+  *dx = *dy = 0;
+  const TrackLeg &g = TRACK_LEGS[4];
+  if (fabs(wrap180f(Est_Psi * (180.0f / PI) - g.psi)) > 45)
+    return false;
+  float L = hypot(g.x1 - g.x0, g.y1 - g.y0);
+  float ux = (g.x1 - g.x0) / L, uy = (g.y1 - g.y0) / L;
+  float back = range_m + US_AHEAD_M + 0.5f * OBST_LENGTH_M; // car centre to the moose's centre
+  return Ekf_PosUpdate(0.5f * (g.x0 + g.x1) - back * ux, 0.5f * (g.y0 + g.y1) - back * uy,
+                       ux, uy, 0.04f, 0.03f, dx, dy);
 }
 
 void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
@@ -1433,8 +1591,13 @@ void ApplicationFunctionSet::ApplicationFunctionSet_Tracking(void)
       // Only a real find ends the search; a glimpse keeps the current search going
       if (millis() - on_line_since >= GLIMPSE_MS || timestamp)
       {
+        // a corner search just found the next leg on its first sweep: the car is at that corner
+        if (!timestamp && BlindDetection && search_phase == 0 && search_leg >= 0)
+          Corner_Fix(search_leg);
         timestamp = true;
         BlindDetection = true;
+        if (millis() - on_line_since >= GLIMPSE_MS)
+          Search_Hint_Until = millis(); // back on the line: the post-pass hint is no longer needed
       }
     }
     else ////The car is not on the black line. execute Blind scan
@@ -2016,7 +2179,7 @@ void ApplicationFunctionSet::CMD_CarControlTimeLimit_xxx0(uint8_t is_CarDirectio
         {
 
 #if _is_print
-          Serial.print('{' + CommandSerialNumber + "_ok}");
+          Serial.print(F("{ok}"));
 #endif
           CarControl_return = true;
         }
@@ -2063,7 +2226,7 @@ void ApplicationFunctionSet::CMD_CarControlTimeLimit_xxx0(void)
         {
 
 #if _is_print
-          Serial.print('{' + CommandSerialNumber + "_ok}");
+          Serial.print(F("{ok}"));
 #endif
           CarControl_return = true;
         }
@@ -2215,13 +2378,13 @@ void ApplicationFunctionSet::CMD_LightingControlTimeLimit_xxx0(uint8_t is_Lighti
       if ((millis() - Application_SmartRobotCarxxx0.CMD_LightingControl_Millis) > (is_LightingTimer)) //Check the timestamp
       {
         LightingControl_TE = true;
-        FastLED.clear(true);
+        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0, NUM_LEDS, CRGB::Black); // (was FastLED.clear)
         Application_SmartRobotCarxxx0.Functional_Mode = CMD_Programming_mode; /*set mode to programming mode<Waiting for the next set of control commands>*/
         if (LightingControl_return == false)
         {
 
 #if _is_print
-          Serial.print('{' + CommandSerialNumber + "_ok}");
+          Serial.print(F("{ok}"));
 #endif
           LightingControl_return = true;
         }
@@ -2262,13 +2425,13 @@ void ApplicationFunctionSet::CMD_LightingControlTimeLimit_xxx0(void)
       if ((millis() - Application_SmartRobotCarxxx0.CMD_LightingControl_Millis) > (CMD_is_LightingTimer)) //Check the timestamp
       {
         LightingControl_TE = true;
-        FastLED.clear(true);
+        AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0, NUM_LEDS, CRGB::Black); // (was FastLED.clear)
         Application_SmartRobotCarxxx0.Functional_Mode = CMD_Programming_mode; /*set mode to programming mode<Waiting for the next set of control commands>*/
         if (LightingControl_return == false)
         {
 
 #if _is_print
-          Serial.print('{' + CommandSerialNumber + "_ok}");
+          Serial.print(F("{ok}"));
 #endif
           LightingControl_return = true;
         }
@@ -2341,7 +2504,7 @@ void ApplicationFunctionSet::CMD_ClearAllFunctions_xxx0(void)
   if (Application_SmartRobotCarxxx0.Functional_Mode == CMD_ClearAllFunctions_Standby_mode) //Command:N100 Clear all functions to enter standby mode
   {
     ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
-    FastLED.clear(true);
+    AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0, NUM_LEDS, CRGB::Black); // (was FastLED.clear)
     AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, NUM_LEDS /*Traversal_Number*/, CRGB::Black);
     Application_SmartRobotCarxxx0.Motion_Control = stop_it;
     Application_SmartRobotCarxxx0.Functional_Mode = Standby_mode;
@@ -2350,7 +2513,7 @@ void ApplicationFunctionSet::CMD_ClearAllFunctions_xxx0(void)
   {
 
     ApplicationFunctionSet_SmartRobotCarMotionControl(stop_it, 0);
-    FastLED.clear(true);
+    AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0, NUM_LEDS, CRGB::Black); // (was FastLED.clear)
     AppRBG_LED.DeviceDriverSet_RBGLED_xxx(0 /*Duration*/, NUM_LEDS /*Traversal_Number*/, CRGB::Black);
     Application_SmartRobotCarxxx0.Motion_Control = stop_it;
     Application_SmartRobotCarxxx0.Functional_Mode = CMD_Programming_mode;
@@ -2371,13 +2534,13 @@ void ApplicationFunctionSet::CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get)
     if (true == UltrasoundDetectionStatus)
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_true}");
+      Serial.print(F("{true}"));
 #endif
     }
     else
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_false}");
+      Serial.print(F("{false}"));
 #endif
     }
   }
@@ -2386,7 +2549,7 @@ void ApplicationFunctionSet::CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get)
     char toString[10];
     sprintf(toString, "%d", UltrasoundData_cm);
 #if _is_print
-    Serial.print('{' + CommandSerialNumber + '_' + toString + '}');
+    { Serial.print('{'); Serial.print(toString); Serial.print('}'); }
 #endif
   }
 }
@@ -2402,19 +2565,19 @@ void ApplicationFunctionSet::CMD_TraceModuleStatus_xxx0(uint8_t is_get)
   {
     sprintf(toString, "%d", TrackingData_L);
 #if _is_print
-    Serial.print('{' + CommandSerialNumber + '_' + toString + '}');
+    { Serial.print('{'); Serial.print(toString); Serial.print('}'); }
 #endif
     /*
     if (true == TrackingDetectionStatus_L)
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_true}");
+      Serial.print(F("{true}"));
 #endif
     }
     else
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_false}");
+      Serial.print(F("{false}"));
 #endif
     }*/
   }
@@ -2422,19 +2585,19 @@ void ApplicationFunctionSet::CMD_TraceModuleStatus_xxx0(uint8_t is_get)
   {
     sprintf(toString, "%d", TrackingData_M);
 #if _is_print
-    Serial.print('{' + CommandSerialNumber + '_' + toString + '}');
+    { Serial.print('{'); Serial.print(toString); Serial.print('}'); }
 #endif
     /*
     if (true == TrackingDetectionStatus_M)
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_true}");
+      Serial.print(F("{true}"));
 #endif
     }
     else
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_false}");
+      Serial.print(F("{false}"));
 #endif
     }*/
   }
@@ -2442,19 +2605,19 @@ void ApplicationFunctionSet::CMD_TraceModuleStatus_xxx0(uint8_t is_get)
   {
     sprintf(toString, "%d", TrackingData_R);
 #if _is_print
-    Serial.print('{' + CommandSerialNumber + '_' + toString + '}');
+    { Serial.print('{'); Serial.print(toString); Serial.print('}'); }
 #endif
     /*
         if (true == TrackingDetectionStatus_R)
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_true}");
+      Serial.print(F("{true}"));
 #endif
     }
     else
     {
 #if _is_print
-      Serial.print('{' + CommandSerialNumber + "_false}");
+      Serial.print(F("{false}"));
 #endif
     }*/
   }
@@ -2706,7 +2869,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     obj_now.dist_cm = Json_Long(buf, "\"D8\":", -1);
     obj_now.lastUpdate = millis();
 
-#if STOP_SIGN_DEBUG
+#if 0 // 1 = echo every camera message the UNO understood, to check the link (off: flash and serial time)
     // Echo every camera message the UNO understood, so you can check the link
     Serial.print(F("{UNO rx type="));
     Serial.print(obj_now.type);
@@ -2719,6 +2882,7 @@ void ApplicationFunctionSet::ApplicationFunctionSet_SerialPortDataAnalysis(void)
     Serial.print('}');
 #endif
     StopSign_Check();
+    Light_Fix();
   }
   // anything else ({"N":100}, {Factory}, {WA_OK}, ...) is ignored
 }

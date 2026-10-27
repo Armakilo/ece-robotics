@@ -20,11 +20,62 @@ delay_xxx(uint16_t _ms)
     delay(1);
   }
 }
-/*RBG LED*/
-static uint32_t Color(uint8_t r, uint8_t g, uint8_t b)
+/*RBG LED
+  The car has ONE WS2812 status LED (PIN_RBGLED = D4 = PD4). It used to be driven by FastLED, which
+  takes ~2 KB of flash; that space is needed for the position estimate (EKF). This sends the 24 bits
+  directly, using the 16 MHz AVR timing loop from Adafruit_NeoPixel (bit = 20 cycles = 1.25 us; a 1
+  stays high ~0.8 us, a 0 ~0.4 us). CRGB from FastLED.h is still used for the colours.*/
+static uint8_t led_brightness = 255;
+
+static void ws2812_show(const CRGB *leds, uint8_t n)
 {
-  return (((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+  uint8_t buf[3 * NUM_LEDS + 1]; // GRB order, scaled by the brightness (+1: the loop reads one ahead)
+  for (uint8_t k = 0; k < n; k++)
+  {
+    buf[3 * k] = ((uint16_t)leds[k].g * (led_brightness + 1)) >> 8;
+    buf[3 * k + 1] = ((uint16_t)leds[k].r * (led_brightness + 1)) >> 8;
+    buf[3 * k + 2] = ((uint16_t)leds[k].b * (led_brightness + 1)) >> 8;
+  }
+  buf[3 * n] = 0;
+  volatile uint8_t *port = &PORTD;
+  uint8_t *ptr = buf;
+  uint8_t mask = _BV(4); // D4
+  uint8_t sreg = SREG;
+  cli();
+  // volatile (as in Adafruit_NeoPixel): otherwise the compiler can put 'next' and 'lo' (equal at the
+  // start) in the same register, and the loop then overwrites 'lo' and never drives the pin low
+  volatile uint8_t hi = PORTD | mask, lo = PORTD & ~mask, next = lo, bit = 8, b = *ptr++;
+  volatile uint16_t count = 3 * n;
+  asm volatile(
+      "head20:"                    "\n\t" // Clk  Pseudocode    (T =  0)
+      "st   %a[port],  %[hi]"      "\n\t" // 2    PORT = hi     (T =  2)
+      "sbrc %[byte],  7"           "\n\t" // 1-2  if(b & 128)
+      "mov  %[next], %[hi]"        "\n\t" // 0-1   next = hi    (T =  4)
+      "dec  %[bit]"                "\n\t" // 1    bit--         (T =  5)
+      "st   %a[port],  %[next]"    "\n\t" // 2    PORT = next   (T =  7)
+      "mov  %[next] ,  %[lo]"      "\n\t" // 1    next = lo     (T =  8)
+      "breq nextbyte20"            "\n\t" // 1-2  if(bit == 0)
+      "rol  %[byte]"               "\n\t" // 1    b <<= 1       (T = 10)
+      "rjmp .+0"                   "\n\t" // 2    nop nop       (T = 12)
+      "nop"                        "\n\t" // 1    nop           (T = 13)
+      "st   %a[port],  %[lo]"      "\n\t" // 2    PORT = lo     (T = 15)
+      "nop"                        "\n\t" // 1    nop           (T = 16)
+      "rjmp .+0"                   "\n\t" // 2    nop nop       (T = 18)
+      "rjmp head20"                "\n\t" // 2    -> head20 (next bit out)
+      "nextbyte20:"                "\n\t" //                    (T = 10)
+      "ldi  %[bit]  ,  8"          "\n\t" // 1    bit = 8       (T = 11)
+      "ld   %[byte] ,  %a[ptr]+"   "\n\t" // 2    b = *ptr++    (T = 13)
+      "st   %a[port], %[lo]"       "\n\t" // 2    PORT = lo     (T = 15)
+      "nop"                        "\n\t" // 1    nop           (T = 16)
+      "sbiw %[count], 1"           "\n\t" // 2    i--           (T = 18)
+      "brne head20"                "\n"   // 2    if(i != 0) -> (next byte)
+      : [port] "+e"(port), [byte] "+r"(b), [bit] "+r"(bit), [next] "+r"(next), [count] "+w"(count),
+        [ptr] "+e"(ptr)
+      : [hi] "r"(hi), [lo] "r"(lo));
+  SREG = sreg;
+  delayMicroseconds(60); // latch
 }
+
 void DeviceDriverSet_RBGLED::DeviceDriverSet_RBGLED_xxx(uint16_t Duration, uint8_t Traversal_Number, CRGB colour)
 {
   if (NUM_LEDS < Traversal_Number)
@@ -34,23 +85,21 @@ void DeviceDriverSet_RBGLED::DeviceDriverSet_RBGLED_xxx(uint16_t Duration, uint8
   for (int Number = 0; Number < Traversal_Number; Number++)
   {
     leds[Number] = colour;
-    FastLED.show();
+    ws2812_show(leds, NUM_LEDS);
     delay_xxx(Duration);
   }
 }
 void DeviceDriverSet_RBGLED::DeviceDriverSet_RBGLED_Init(uint8_t set_Brightness)
 {
-  FastLED.addLeds<NEOPIXEL, PIN_RBGLED>(leds, NUM_LEDS);
-  FastLED.setBrightness(set_Brightness);
+  pinMode(PIN_RBGLED, OUTPUT);
+  digitalWrite(PIN_RBGLED, LOW);
+  led_brightness = set_Brightness;
 }
 #if _Test_DeviceDriverSet
 void DeviceDriverSet_RBGLED::DeviceDriverSet_RBGLED_Test(void)
 {
   leds[0] = CRGB::White;
-  FastLED.show();
-  delay_xxx(50);
-  leds[1] = CRGB::Red;
-  FastLED.show();
+  ws2812_show(leds, NUM_LEDS);
   delay_xxx(50);
   DeviceDriverSet_RBGLED_xxx(50 /*Duration*/, 5 /*Traversal_Number*/, CRGB::Black);
 }
@@ -62,13 +111,14 @@ void DeviceDriverSet_RBGLED::DeviceDriverSet_RBGLED_Color(uint8_t LED_s, uint8_t
     return;
   if (LED_s == NUM_LEDS)
   {
-    FastLED.showColor(Color(r, g, b));
+    for (uint8_t k = 0; k < NUM_LEDS; k++)
+      leds[k] = CRGB(r, g, b);
   }
   else
   {
-    leds[LED_s] = Color(r, g, b);
+    leds[LED_s] = CRGB(r, g, b);
   }
-  FastLED.show();
+  ws2812_show(leds, NUM_LEDS);
 }
 
 /*Key*/

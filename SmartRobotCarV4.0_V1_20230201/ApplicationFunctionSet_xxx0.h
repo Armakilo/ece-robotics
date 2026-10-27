@@ -100,7 +100,8 @@ public:
   const float VoltageDetection = 7.00;
   const uint8_t ObstacleDetection = 20;
 
-  String CommandSerialNumber;
+  // (String CommandSerialNumber removed: only the phone-app replies used it, and a String pulls in
+  //  the whole heap allocator, ~1 KB of flash)
   uint8_t Rocker_CarSpeed = 250;
   uint8_t Rocker_temp;
 
