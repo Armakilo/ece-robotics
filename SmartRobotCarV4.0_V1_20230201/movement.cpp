@@ -2,36 +2,6 @@
 
 #include "movement.h"
 
-/*---------------- Overtaking (Bug algorithm) ----------------
-  Detection (Obstacle_Ahead): the front ultrasonic must read OBST_MIN_CM..OBST_DETECT_CM on
-  OBST_CONFIRM_N pings in a row, and only while the car is really following the line. Before, one
-  bad ping started a pass, and the sensor was also read while the car spun in a line search, so it
-  saw walls and chairs at the corners ("activates randomly").
-
-  Side (Pass_Side): always the OUTSIDE of the track. Both loops of the figure 8 meet at the crossing
-  (X = CROSSING_X): the right-turn loop is at X > CROSSING_X, so its outside is on the LEFT; the
-  left-turn loop is at X < CROSSING_X, so its outside is on the RIGHT. The point checked is a little
-  ahead of the car (where the obstacle is). Before, it always passed on the right.
-
-  Manoeuvre (bug_pass), each step closed-loop on the gyro and the position estimate:
-    1. turn PASS_OUT_DEG toward the pass side
-    2. drive out until PASS_OFFSET_M beside the line: half the obstacle + half the car + clearance
-    3. turn back parallel to the line, point the ultrasonic at the obstacle
-    4. drive beside it until the car's rear is past the obstacle's far end (worked out from where the
-       obstacle was measured and OBST_LENGTH_M) - the Bug "leave" point. If the side sensor still sees
-       something there (a robot moving the same way), keep going while it does, up to PASS_EXTRA_MAX_M.
-    5. turn PASS_OUT_DEG back toward the line
-    6. drive until an IR sensor sees the line (gives up after PASS_RETURN_MAX_M)
-    7. drive on SENSOR_AHEAD_M so the wheels are on the line, then turn parallel to it and hand back
-       to the line tracker (with a search hint toward the line in case it isn't under the sensors)
-  Before, the manoeuvre was timed, the side check never ran (first_time was already > 500 ms), and
-  the way back was shorter than the way out, so it ended ~0.2 m beside the line and lost it.
-
-  Events sent to the ESP32 (shown as "UNO: ..." on its debug serial):
-    {OB,obstacle_x_mm,obstacle_y_mm,side,fix_dx,fix_dy,used}  pass started (side 0 = left, 1 = right;
-                                           position before the moose fix; used = moose fix applied)
-    {OV,time_ms,side,line_found}           pass finished
-*/
 #define OBST_DETECT_CM      20    // start a pass when the obstacle is this close ahead
 #define OBST_MIN_CM         3     // readings below this are noise
 #define OBST_CONFIRM_N      3     // close readings in a row needed to start a pass
@@ -131,9 +101,9 @@ static bool checkLine(void)
 
 static float wrap180(float deg)
 {
-  while (deg > 180)
+  if (deg > 180)
     deg -= 360;
-  while (deg < -180)
+  if (deg < -180)
     deg += 360;
   return deg;
 }

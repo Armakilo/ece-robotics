@@ -1,0 +1,181 @@
+/*
+ * @Author: ELEGOO
+ * @Date: 2019-10-22 11:59:09
+ * @LastEditTime: 2020-12-29 16:04:05
+ * @LastEditors: Changhua
+ * @Description: Smart Robot Car V4.0
+ * @FilePath: 
+ */
+#ifndef _ApplicationFunctionSet_xxx0_H_
+#define _ApplicationFunctionSet_xxx0_H_
+
+#include <Arduino.h>
+
+typedef struct  // only will really be used to track one object at a time.
+{
+  // the raw data for the object coming in
+  char type; //'S' = stop sign, 'O' = obstacle, 'C' = car, 'N' = none
+  uint16_t cent_x;
+  uint16_t cent_y;
+  uint16_t width; //estimate of width of bbox
+  uint16_t height; //estimate of height of bbox unnecessary, but kept as a legacy feature
+  char colour; //colour of object, 'R' = red, 'B' = blue, 'G' = green, '?' = none. Based off of values sent from the ESP
+  uint16_t sizePX; //new
+  int16_t dist_cm; // FIX: was uint8_t, but the ESP sends -1 for "too far", which became 255
+  unsigned long lastUpdate;
+
+} object_t;
+
+
+/*Movement Direction Control List*/
+enum SmartRobotCarMotionControl
+{
+  Forward,       //(1)
+  Backward,      //(2)
+  Left,          //(3)
+  Right,         //(4)
+  LeftForward,   //(5)
+  LeftBackward,  //(6)
+  RightForward,  //(7)
+  RightBackward, //(8)
+  stop_it        //(9)
+};               //direction方向:（1）、（2）、 （3）、（4）、（5）、（6）
+
+void ApplicationFunctionSet_SmartRobotCarMotionControl(SmartRobotCarMotionControl direction, uint8_t is_speed); //can go to one side
+
+
+class ApplicationFunctionSet
+{
+public:
+  void ApplicationFunctionSet_Init(void);
+  void ApplicationFunctionSet_Bootup(void);
+  void ApplicationFunctionSet_RGB(void);
+  void ApplicationFunctionSet_Expression(void);
+  void ApplicationFunctionSet_Rocker(void);             //APP Rocker Control
+  void ApplicationFunctionSet_Tracking(void);           //Line Tracking Mode
+  void ApplicationFunctionSet_Obstacle(void);           //Obstacle Avoidance
+  void ApplicationFunctionSet_Follow(void);             //Following Mode
+  void ApplicationFunctionSet_Servo(uint8_t Set_Servo); //Servo Control
+  void ApplicationFunctionSet_Standby(void);            //Standby Mode
+  void ApplicationFunctionSet_KeyCommand(void);         //Mode Switch Button
+  void ApplicationFunctionSet_SensorDataUpdate(void);   //Sensor Data Update
+  void ApplicationFunctionSet_SerialPortDataAnalysis(void);
+  void ApplicationFunctionSet_IRrecv(void);
+  void ApplicationFunctionSet_ForceTrackingMode(void); // put the car in line-tracking mode
+  bool ApplicationFunctionSet_EStop(void);             // web page emergency stop, true while engaged
+  bool ApplicationFunctionSet_TrafficLight(void);      // start: wait for red then green, true while waiting
+  void ApplicationFunctionSet_Telemetry(bool estop_active); // send heading/state to the ESP32 logger
+  
+
+public: /*CMD*/
+  void CMD_UltrasoundModuleStatus_xxx0(uint8_t is_get);
+  void CMD_TraceModuleStatus_xxx0(uint8_t is_get);
+  void CMD_Car_LeaveTheGround_xxx0(uint8_t is_get);
+
+  void CMD_inspect_xxx0(void);
+  void CMD_MotorControl_xxx0(void);
+  void CMD_MotorControl_xxx0(uint8_t is_MotorSelection, uint8_t is_MotorDirection, uint8_t is_MotorSpeed);
+  void CMD_CarControlTimeLimit_xxx0(void);
+  void CMD_CarControlTimeLimit_xxx0(uint8_t is_CarDirection, uint8_t is_CarSpeed, uint32_t is_Timer);
+  void CMD_CarControlNoTimeLimit_xxx0(void);
+  void CMD_CarControlNoTimeLimit_xxx0(uint8_t is_CarDirection, uint8_t is_CarSpeed);
+  void CMD_MotorControlSpeed_xxx0(void);
+  void CMD_MotorControlSpeed_xxx0(uint8_t is_Speed_L, uint8_t is_Speed_R);
+  void CMD_ServoControl_xxx0(void);
+  void CMD_VoiceControl_xxx0(uint16_t is_VoiceName, uint32_t is_VoiceTimer);
+  void CMD_LightingControlTimeLimit_xxx0(void);
+  void CMD_LightingControlTimeLimit_xxx0(uint8_t is_LightingSequence, uint8_t is_LightingColorValue_R, uint8_t is_LightingColorValue_G, uint8_t is_LightingColorValue_B, uint32_t is_LightingTimer);
+  void CMD_LightingControlNoTimeLimit_xxx0(void);
+  void CMD_LightingControlNoTimeLimit_xxx0(uint8_t is_LightingSequence, uint8_t is_LightingColorValue_R, uint8_t is_LightingColorValue_G, uint8_t is_LightingColorValue_B);
+  void CMD_LEDCustomExpressionControl_xxx0(void);
+  void CMD_ClearAllFunctions_xxx0(void);
+  void CMD_LEDNumberDisplayControl_xxx0(uint8_t is_LEDNumber);
+  void CMD_TrajectoryControl_xxx0(void);
+
+private:
+  /*Sensor Raw Value*/
+  volatile float VoltageData_V;        //Battery Voltage Value
+  volatile uint16_t UltrasoundData_mm; //Ultrasonic Sensor Value (mm)
+  volatile uint16_t UltrasoundData_cm; //Ultrasonic Sensor Value (cm)
+  volatile int TrackingData_L;         //Line Tracking Module Value (Left)
+  volatile int TrackingData_M;         //Line Tracking Module Value (Middle)
+  volatile int TrackingData_R;         //Line Tracking Module Value (Right)
+  /*Sensor Status*/
+  boolean VoltageDetectionStatus = false;
+  boolean UltrasoundDetectionStatus = false;
+  boolean TrackingDetectionStatus_R = false;
+  boolean TrackingDetectionStatus_M = false;
+  boolean TrackingDetectionStatus_L = false;
+
+public:
+  boolean Car_LeaveTheGround = true;
+
+  /*Sensor Threshold Setting*/
+  const float VoltageDetection = 7.00;
+  const uint8_t ObstacleDetection = 20;
+
+  // (String CommandSerialNumber removed: only the phone-app replies used it, and a String pulls in
+  //  the whole heap allocator, ~1 KB of flash)
+  uint8_t Rocker_CarSpeed = 250;
+  uint8_t Rocker_temp;
+
+public:
+  // Line sensor thresholds for BLACK TAPE ON GRAY FLOOR (measured with LineSensor_Calibration.ino,
+  // two spots on the track). A sensor is on the line when  its threshold <= reading <= TrackingDetection_E.
+  // The three sensors read very differently on the same floor, so each has its own threshold:
+  //            floor max   tape        lifted
+  //   L (A2)   707         845-886     ~1003
+  //   M (A1)   364         699-737     ~998
+  //   R (A0)   581         809-843     ~1007
+  // Thresholds are halfway between floor max and tape min. L has the least margin (~70 each side):
+  // if the car sees the line on bare floor, raise L; if it misses the tape, lower it.
+  uint16_t TrackingDetection_SL = 775;
+  uint16_t TrackingDetection_SM = 530;
+  uint16_t TrackingDetection_SR = 695;
+  uint16_t TrackingDetection_S = 250;  // old single threshold, only used by the unused IR-remote code
+                                        // (was uint8_t, which can't hold the new values above 255)
+  uint16_t TrackingDetection_E = 940;  // between the tape max (886) and lifted (~996). Was 850.
+  uint16_t TrackingDetection_V = 950;  // all three above this = car lifted off the ground
+
+public:
+  uint8_t CMD_is_Servo;
+  uint8_t CMD_is_Servo_angle;
+
+public:
+  uint8_t CMD_is_MotorSelection; //motor
+  uint8_t CMD_is_MotorDirection;
+  uint8_t CMD_is_MotorSpeed;
+  uint32_t CMD_is_MotorTimer;
+
+public:
+  uint8_t CMD_is_CarDirection; //car
+  uint8_t CMD_is_CarSpeed;
+  uint32_t CMD_is_CarTimer;
+
+public:
+  uint8_t CMD_is_MotorSpeed_L; //motor
+  uint8_t CMD_is_MotorSpeed_R;
+
+public:
+  uint8_t CMD_is_LightingSequence; //Lighting (Left, front, right, back and center)
+  uint8_t CMD_is_LightingColorValue_R;
+  uint8_t CMD_is_LightingColorValue_G;
+  uint8_t CMD_is_LightingColorValue_B;
+  uint32_t CMD_is_LightingTimer;
+
+private:
+  uint8_t CMD_is_FastLED_setBrightness = 20;
+};
+extern ApplicationFunctionSet Application_FunctionSet;
+extern float Heading_Predicted; // degrees, from the kinematic; logged by ApplicationFunctionSet_Telemetry
+extern bool EStop_Pressed;      // set by every E-stop press; bug_pass() clears it when a pass starts and
+                                // cancels the pass if it gets set (even if a release is read straight after)
+
+// Kinematic (dead reckoning). Pose in the inertial frame: metres, metres, radians.
+extern float Pose_X, Pose_Y, Pose_Psi;
+// Gyro-fused estimate (metres, metres, radians) and the gyro heading (degrees, + = left)
+extern float Est_X, Est_Y, Est_Psi, Heading_Gyro;
+void Kinematics_Update(void); // call every loop
+void Kinematics_Reset(void);  // set the origin to the car's current position (start line)
+boolean function_xxx(long x, long s, long e); //f(x)
+#endif

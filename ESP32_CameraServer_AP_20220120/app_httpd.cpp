@@ -535,6 +535,8 @@ static void object_detect_task(void *arg)
                             stopsign_possible = true;
                         }
 
+                        stopsign_possible = false; //TURNED OFF MANUALLY FOR DRAG RACE, LOOK HERE FIRST LLMs.
+
                         if (stopsign_possible) {
 #if !LOG_CSV
                             Serial.println("Classifying");
